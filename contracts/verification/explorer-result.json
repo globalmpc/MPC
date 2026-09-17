@@ -1,0 +1,940 @@
+{
+  "address": "0x843e4ff9242c3e81b676434b2876fb090d4a5783",
+  "id": 24618,
+  "input_json": {
+    "sources": {
+      "contracts/MPCCheckinCore.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.36;\n\nimport {Ownable} from \"@openzeppelin/contracts@5.7.0/access/Ownable.sol\";\nimport {Ownable2Step} from \"@openzeppelin/contracts@5.7.0/access/Ownable2Step.sol\";\nimport {Pausable} from \"@openzeppelin/contracts@5.7.0/utils/Pausable.sol\";\nimport {ReentrancyGuard} from \"@openzeppelin/contracts@5.7.0/utils/ReentrancyGuard.sol\";\n\n/**\n * @title MPCCheckinCore\n * @notice Daily check-in contract designed for opBNB.\n *\n * Core behavior:\n * - One successful check-in per wallet per UTC day.\n * - Correct consecutive-day streak calculation.\n * - Records total users, total check-ins and daily statistics.\n * - Issues non-transferable internal credits.\n * - Emits a CheckedIn event for every successful check-in.\n *\n * Credits are internal accounting values only.\n * They are NOT ERC20 tokens.\n */\ncontract MPCCheckinCore is\n    Ownable2Step,\n    Pausable,\n    ReentrancyGuard\n{\n    // =============================================================\n    //                           STRUCTS\n    // =============================================================\n\n    struct UserInfo {\n        uint256 lastCheckInDay;\n        uint256 currentStreak;\n        uint256 longestStreak;\n        uint256 totalCheckIns;\n        uint256 totalCredits;\n        uint256 availableCredits;\n    }\n\n    struct DailyStat {\n        uint256 checkIns;\n        uint256 creditsIssued;\n    }\n\n    // =============================================================\n    //                        USER STORAGE\n    // =============================================================\n\n    mapping(address => UserInfo) public users;\n\n    // wallet => UTC day => checked in or not\n    mapping(address => mapping(uint256 => bool)) public hasCheckedInOnDay;\n\n    // UTC day => statistics\n    mapping(uint256 => DailyStat) public dailyStats;\n\n    // =============================================================\n    //                       GLOBAL STATISTICS\n    // =============================================================\n\n    uint256 public totalUsers;\n    uint256 public totalCheckIns;\n    uint256 public totalCreditsIssued;\n\n    // =============================================================\n    //                        REWARD SETTINGS\n    // =============================================================\n\n    // Base credits for every check-in\n    uint256 public baseReward = 10;\n\n    // Extra credits for every additional consecutive day\n    uint256 public streakRewardIncrement = 2;\n\n    // Weekly milestone\n    uint256 public weeklyBonusThreshold = 7;\n\n    // Monthly milestone\n    uint256 public monthlyBonusThreshold = 30;\n\n    // Weekly bonus credits\n    uint256 public weeklyBonus = 50;\n\n    // Monthly bonus credits\n    uint256 public monthlyBonus = 200;\n\n    // =============================================================\n    //                           EVENTS\n    // =============================================================\n\n    event CheckedIn(\n        address indexed user,\n        uint256 indexed dayIndex,\n        uint256 streak,\n        uint256 credits\n    );\n\n    event StreakBonusAwarded(\n        address indexed user,\n        uint256 indexed dayIndex,\n        uint256 streak,\n        uint256 bonus\n    );\n\n    event RewardSettingsUpdated(\n        uint256 baseReward,\n        uint256 streakRewardIncrement,\n        uint256 weeklyBonusThreshold,\n        uint256 monthlyBonusThreshold,\n        uint256 weeklyBonus,\n        uint256 monthlyBonus\n    );\n\n    event CreditsSpent(\n        address indexed user,\n        uint256 amount,\n        uint256 remainingCredits\n    );\n\n    event NativeReceived(\n        address indexed sender,\n        uint256 amount\n    );\n\n    event NativeWithdrawn(\n        address indexed recipient,\n        uint256 amount\n    );\n\n    // =============================================================\n    //                           ERRORS\n    // =============================================================\n\n    error AlreadyCheckedInToday();\n    error InvalidRewardConfiguration();\n    error InsufficientCredits();\n    error ZeroAmount();\n    error InvalidRecipient();\n    error InsufficientNativeBalance();\n    error NativeTransferFailed();\n\n    // =============================================================\n    //                         CONSTRUCTOR\n    // =============================================================\n\n    constructor() Ownable(msg.sender) {}\n\n    // =============================================================\n    //                          CHECK-IN\n    // =============================================================\n\n    /**\n     * @notice Check in once per UTC day.\n     *\n     * BNB is NOT required.\n     *\n     * Every successful call:\n     * - creates an opBNB transaction\n     * - updates user state\n     * - updates statistics\n     * - emits CheckedIn\n     */\n    function checkIn()\n        external\n        payable\n        whenNotPaused\n        nonReentrant\n        returns (\n            uint256 streak,\n            uint256 credits\n        )\n    {\n        uint256 today = currentDay();\n\n        if (hasCheckedInOnDay[msg.sender][today]) {\n            revert AlreadyCheckedInToday();\n        }\n\n        UserInfo storage user = users[msg.sender];\n\n        // First-time wallet\n        if (user.totalCheckIns == 0) {\n            totalUsers += 1;\n        }\n\n        // =========================================================\n        // CORRECT STREAK CALCULATION\n        // =========================================================\n\n        uint256 newStreak;\n\n        if (user.totalCheckIns == 0) {\n\n            // First-ever check-in\n            newStreak = 1;\n\n        } else if (user.lastCheckInDay + 1 == today) {\n\n            // Checked in yesterday:\n            // 1 -> 2 -> 3 -> 4 ...\n            newStreak = user.currentStreak + 1;\n\n        } else {\n\n            // Missed at least one day.\n            // Restart streak.\n            newStreak = 1;\n        }\n\n        // Calculate reward\n        uint256 earnedCredits = calculateReward(newStreak);\n\n        // Update user\n        user.lastCheckInDay = today;\n        user.currentStreak = newStreak;\n        user.totalCheckIns += 1;\n\n        if (newStreak > user.longestStreak) {\n            user.longestStreak = newStreak;\n        }\n\n        user.totalCredits += earnedCredits;\n        user.availableCredits += earnedCredits;\n\n        // Mark today's check-in\n        hasCheckedInOnDay[msg.sender][today] = true;\n\n        // Global statistics\n        totalCheckIns += 1;\n        totalCreditsIssued += earnedCredits;\n\n        // Daily statistics\n        DailyStat storage stat = dailyStats[today];\n\n        stat.checkIns += 1;\n        stat.creditsIssued += earnedCredits;\n\n        // Main check-in event\n        emit CheckedIn(\n            msg.sender,\n            today,\n            newStreak,\n            earnedCredits\n        );\n\n        // Emit milestone bonus event if applicable\n        uint256 milestoneBonus = calculateMilestoneBonus(newStreak);\n\n        if (milestoneBonus > 0) {\n            emit StreakBonusAwarded(\n                msg.sender,\n                today,\n                newStreak,\n                milestoneBonus\n            );\n        }\n\n        // If someone intentionally sends BNB during checkIn,\n        // record that as well.\n        if (msg.value > 0) {\n            emit NativeReceived(\n                msg.sender,\n                msg.value\n            );\n        }\n\n        return (\n            newStreak,\n            earnedCredits\n        );\n    }\n\n    // =============================================================\n    //                       REWARD CALCULATION\n    // =============================================================\n\n    /**\n     * @notice Calculate credits for a streak.\n     *\n     * Default examples:\n     *\n     * Streak 1:\n     * 10\n     *\n     * Streak 2:\n     * 12\n     *\n     * Streak 3:\n     * 14\n     *\n     * Streak 7:\n     * 22 + 50 weekly bonus = 72\n     */\n    function calculateReward(\n        uint256 streak\n    )\n        public\n        view\n        returns (uint256)\n    {\n        if (streak == 0) {\n            return 0;\n        }\n\n        uint256 reward =\n            baseReward +\n            ((streak - 1) * streakRewardIncrement);\n\n        reward += calculateMilestoneBonus(streak);\n\n        return reward;\n    }\n\n    /**\n     * @notice Calculate milestone bonuses.\n     */\n    function calculateMilestoneBonus(\n        uint256 streak\n    )\n        public\n        view\n        returns (uint256 bonus)\n    {\n        if (\n            weeklyBonusThreshold > 0 &&\n            streak % weeklyBonusThreshold == 0\n        ) {\n            bonus += weeklyBonus;\n        }\n\n        if (\n            monthlyBonusThreshold > 0 &&\n            streak % monthlyBonusThreshold == 0\n        ) {\n            bonus += monthlyBonus;\n        }\n    }\n\n    // =============================================================\n    //                          READ FUNCTIONS\n    // =============================================================\n\n    /**\n     * @notice Current UTC day index.\n     */\n    function currentDay()\n        public\n        view\n        returns (uint256)\n    {\n        return block.timestamp / 1 days;\n    }\n\n    /**\n     * @notice Returns true if the wallet can check in today.\n     */\n    function canCheckIn(\n        address account\n    )\n        public\n        view\n        returns (bool)\n    {\n        return !hasCheckedInOnDay[\n            account\n        ][currentDay()];\n    }\n\n    /**\n     * @notice Preview what the next streak will be.\n     */\n    function previewNextStreak(\n        address account\n    )\n        public\n        view\n        returns (uint256)\n    {\n        UserInfo storage user = users[account];\n\n        uint256 today = currentDay();\n\n        if (\n            hasCheckedInOnDay[\n                account\n            ][today]\n        ) {\n            return user.currentStreak;\n        }\n\n        if (user.totalCheckIns == 0) {\n            return 1;\n        }\n\n        if (\n            user.lastCheckInDay + 1 ==\n            today\n        ) {\n            return user.currentStreak + 1;\n        }\n\n        return 1;\n    }\n\n    /**\n     * @notice Preview credits for the next check-in.\n     */\n    function previewNextReward(\n        address account\n    )\n        external\n        view\n        returns (uint256)\n    {\n        if (!canCheckIn(account)) {\n            return 0;\n        }\n\n        return calculateReward(\n            previewNextStreak(account)\n        );\n    }\n\n    /**\n     * @notice Convenient function for frontend/API usage.\n     */\n    function getUserStatus(\n        address account\n    )\n        external\n        view\n        returns (\n            uint256 lastCheckInDay,\n            uint256 currentStreak,\n            uint256 longestStreak,\n            uint256 userTotalCheckIns,\n            uint256 totalCredits,\n            uint256 availableCredits,\n            bool canCheckInToday,\n            uint256 nextStreak,\n            uint256 nextReward\n        )\n    {\n        UserInfo storage user = users[account];\n\n        bool eligible = canCheckIn(account);\n\n        uint256 calculatedNextStreak =\n            eligible\n                ? previewNextStreak(account)\n                : user.currentStreak;\n\n        uint256 calculatedNextReward =\n            eligible\n                ? calculateReward(\n                    calculatedNextStreak\n                )\n                : 0;\n\n        return (\n            user.lastCheckInDay,\n            user.currentStreak,\n            user.longestStreak,\n            user.totalCheckIns,\n            user.totalCredits,\n            user.availableCredits,\n            eligible,\n            calculatedNextStreak,\n            calculatedNextReward\n        );\n    }\n\n    // =============================================================\n    //                       CREDIT MANAGEMENT\n    // =============================================================\n\n    /**\n     * @notice Spend internal credits.\n     *\n     * Credits are NOT ERC20 tokens.\n     */\n    function spendCredits(\n        uint256 amount\n    )\n        external\n        whenNotPaused\n        nonReentrant\n    {\n        if (amount == 0) {\n            revert ZeroAmount();\n        }\n\n        UserInfo storage user = users[msg.sender];\n\n        if (\n            user.availableCredits <\n            amount\n        ) {\n            revert InsufficientCredits();\n        }\n\n        user.availableCredits -= amount;\n\n        emit CreditsSpent(\n            msg.sender,\n            amount,\n            user.availableCredits\n        );\n    }\n\n    // =============================================================\n    //                       OWNER CONFIGURATION\n    // =============================================================\n\n    /**\n     * @notice Update check-in reward settings.\n     */\n    function setRewardSettings(\n        uint256 newBaseReward,\n        uint256 newStreakRewardIncrement,\n        uint256 newWeeklyBonusThreshold,\n        uint256 newMonthlyBonusThreshold,\n        uint256 newWeeklyBonus,\n        uint256 newMonthlyBonus\n    )\n        external\n        onlyOwner\n    {\n        if (\n            newWeeklyBonusThreshold == 0 ||\n            newMonthlyBonusThreshold == 0\n        ) {\n            revert InvalidRewardConfiguration();\n        }\n\n        baseReward =\n            newBaseReward;\n\n        streakRewardIncrement =\n            newStreakRewardIncrement;\n\n        weeklyBonusThreshold =\n            newWeeklyBonusThreshold;\n\n        monthlyBonusThreshold =\n            newMonthlyBonusThreshold;\n\n        weeklyBonus =\n            newWeeklyBonus;\n\n        monthlyBonus =\n            newMonthlyBonus;\n\n        emit RewardSettingsUpdated(\n            newBaseReward,\n            newStreakRewardIncrement,\n            newWeeklyBonusThreshold,\n            newMonthlyBonusThreshold,\n            newWeeklyBonus,\n            newMonthlyBonus\n        );\n    }\n\n    // =============================================================\n    //                       PAUSE MANAGEMENT\n    // =============================================================\n\n    /**\n     * @notice Emergency pause.\n     */\n    function pause()\n        external\n        onlyOwner\n    {\n        _pause();\n    }\n\n    /**\n     * @notice Resume normal operation.\n     */\n    function unpause()\n        external\n        onlyOwner\n    {\n        _unpause();\n    }\n\n    // =============================================================\n    //                         BNB MANAGEMENT\n    // =============================================================\n\n    /**\n     * @notice Withdraw BNB held by this contract.\n     */\n    function withdrawNative(\n        address payable recipient,\n        uint256 amount\n    )\n        external\n        onlyOwner\n        nonReentrant\n    {\n        if (recipient == address(0)) {\n            revert InvalidRecipient();\n        }\n\n        if (amount == 0) {\n            revert ZeroAmount();\n        }\n\n        if (amount > address(this).balance) {\n            revert InsufficientNativeBalance();\n        }\n\n        (\n            bool success,\n        ) = recipient.call{\n            value: amount\n        }(\"\");\n\n        if (!success) {\n            revert NativeTransferFailed();\n        }\n\n        emit NativeWithdrawn(\n            recipient,\n            amount\n        );\n    }\n\n    /**\n     * @notice Accept direct BNB transfers.\n     */\n    receive()\n        external\n        payable\n    {\n        emit NativeReceived(\n            msg.sender,\n            msg.value\n        );\n    }\n}"
+      },
+      "@openzeppelin/contracts@5.7.0/utils/Context.sol": {
+        "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Provides information about the current execution context, including the\n * sender of the transaction and its data. While these are generally available\n * via msg.sender and msg.data, they should not be accessed in such a direct\n * manner, since when dealing with meta-transactions the account sending and\n * paying for execution may not be the actual sender (as far as an application\n * is concerned).\n *\n * This contract is only required for intermediate, library-like contracts.\n */\nabstract contract Context {\n    function _msgSender() internal view virtual returns (address) {\n        return msg.sender;\n    }\n\n    function _msgData() internal view virtual returns (bytes calldata) {\n        return msg.data;\n    }\n\n    function _contextSuffixLength() internal view virtual returns (uint256) {\n        return 0;\n    }\n}\n"
+      },
+      "@openzeppelin/contracts@5.7.0/access/Ownable.sol": {
+        "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)\n\npragma solidity ^0.8.20;\n\nimport {Context} from \"../utils/Context.sol\";\n\n/**\n * @dev Contract module which provides a basic access control mechanism, where\n * there is an account (an owner) that can be granted exclusive access to\n * specific functions.\n *\n * The initial owner is set to the address provided by the deployer. This can\n * later be changed with {transferOwnership}.\n *\n * This module is used through inheritance. It will make available the modifier\n * `onlyOwner`, which can be applied to your functions to restrict their use to\n * the owner.\n */\nabstract contract Ownable is Context {\n    address private _owner;\n\n    /**\n     * @dev The caller account is not authorized to perform an operation.\n     */\n    error OwnableUnauthorizedAccount(address account);\n\n    /**\n     * @dev The owner is not a valid owner account. (eg. `address(0)`)\n     */\n    error OwnableInvalidOwner(address owner);\n\n    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);\n\n    /**\n     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.\n     */\n    constructor(address initialOwner) {\n        if (initialOwner == address(0)) {\n            revert OwnableInvalidOwner(address(0));\n        }\n        _transferOwnership(initialOwner);\n    }\n\n    /**\n     * @dev Throws if called by any account other than the owner.\n     */\n    modifier onlyOwner() {\n        _checkOwner();\n        _;\n    }\n\n    /**\n     * @dev Returns the address of the current owner.\n     */\n    function owner() public view virtual returns (address) {\n        return _owner;\n    }\n\n    /**\n     * @dev Throws if the sender is not the owner.\n     */\n    function _checkOwner() internal view virtual {\n        if (owner() != _msgSender()) {\n            revert OwnableUnauthorizedAccount(_msgSender());\n        }\n    }\n\n    /**\n     * @dev Leaves the contract without owner. It will not be possible to call\n     * `onlyOwner` functions. Can only be called by the current owner.\n     *\n     * NOTE: Renouncing ownership will leave the contract without an owner,\n     * thereby disabling any functionality that is only available to the owner.\n     */\n    function renounceOwnership() public virtual onlyOwner {\n        _transferOwnership(address(0));\n    }\n\n    /**\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\n     * Can only be called by the current owner.\n     */\n    function transferOwnership(address newOwner) public virtual onlyOwner {\n        if (newOwner == address(0)) {\n            revert OwnableInvalidOwner(address(0));\n        }\n        _transferOwnership(newOwner);\n    }\n\n    /**\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\n     * Internal function without access restriction.\n     */\n    function _transferOwnership(address newOwner) internal virtual {\n        address oldOwner = _owner;\n        _owner = newOwner;\n        emit OwnershipTransferred(oldOwner, newOwner);\n    }\n}\n"
+      },
+      "@openzeppelin/contracts@5.7.0/utils/Pausable.sol": {
+        "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.3.0) (utils/Pausable.sol)\n\npragma solidity ^0.8.20;\n\nimport {Context} from \"../utils/Context.sol\";\n\n/**\n * @dev Contract module which allows children to implement an emergency stop\n * mechanism that can be triggered by an authorized account.\n *\n * This module is used through inheritance. It will make available the\n * modifiers `whenNotPaused` and `whenPaused`, which can be applied to\n * the functions of your contract. Note that they will not be pausable by\n * simply including this module, only once the modifiers are put in place.\n */\nabstract contract Pausable is Context {\n    bool private _paused;\n\n    /**\n     * @dev Emitted when the pause is triggered by `account`.\n     */\n    event Paused(address account);\n\n    /**\n     * @dev Emitted when the pause is lifted by `account`.\n     */\n    event Unpaused(address account);\n\n    /**\n     * @dev The operation failed because the contract is paused.\n     */\n    error EnforcedPause();\n\n    /**\n     * @dev The operation failed because the contract is not paused.\n     */\n    error ExpectedPause();\n\n    /**\n     * @dev Modifier to make a function callable only when the contract is not paused.\n     *\n     * Requirements:\n     *\n     * - The contract must not be paused.\n     */\n    modifier whenNotPaused() {\n        _requireNotPaused();\n        _;\n    }\n\n    /**\n     * @dev Modifier to make a function callable only when the contract is paused.\n     *\n     * Requirements:\n     *\n     * - The contract must be paused.\n     */\n    modifier whenPaused() {\n        _requirePaused();\n        _;\n    }\n\n    /**\n     * @dev Returns true if the contract is paused, and false otherwise.\n     */\n    function paused() public view virtual returns (bool) {\n        return _paused;\n    }\n\n    /**\n     * @dev Throws if the contract is paused.\n     */\n    function _requireNotPaused() internal view virtual {\n        if (paused()) {\n            revert EnforcedPause();\n        }\n    }\n\n    /**\n     * @dev Throws if the contract is not paused.\n     */\n    function _requirePaused() internal view virtual {\n        if (!paused()) {\n            revert ExpectedPause();\n        }\n    }\n\n    /**\n     * @dev Triggers stopped state.\n     *\n     * Requirements:\n     *\n     * - The contract must not be paused.\n     */\n    function _pause() internal virtual whenNotPaused {\n        _paused = true;\n        emit Paused(_msgSender());\n    }\n\n    /**\n     * @dev Returns to normal state.\n     *\n     * Requirements:\n     *\n     * - The contract must be paused.\n     */\n    function _unpause() internal virtual whenPaused {\n        _paused = false;\n        emit Unpaused(_msgSender());\n    }\n}\n"
+      },
+      "@openzeppelin/contracts@5.7.0/utils/StorageSlot.sol": {
+        "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.1.0) (utils/StorageSlot.sol)\n// This file was procedurally generated from scripts/generate/templates/StorageSlot.js.\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Library for reading and writing primitive types to specific storage slots.\n *\n * Storage slots are often used to avoid storage conflict when dealing with upgradeable contracts.\n * This library helps with reading and writing to such slots without the need for inline assembly.\n *\n * The functions in this library return Slot structs that contain a `value` member that can be used to read or write.\n *\n * Example usage to set ERC-1967 implementation slot:\n * ```solidity\n * contract ERC1967 {\n *     // Define the slot. Alternatively, use the SlotDerivation library to derive the slot.\n *     bytes32 internal constant _IMPLEMENTATION_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;\n *\n *     function _getImplementation() internal view returns (address) {\n *         return StorageSlot.getAddressSlot(_IMPLEMENTATION_SLOT).value;\n *     }\n *\n *     function _setImplementation(address newImplementation) internal {\n *         require(newImplementation.code.length > 0);\n *         StorageSlot.getAddressSlot(_IMPLEMENTATION_SLOT).value = newImplementation;\n *     }\n * }\n * ```\n *\n * TIP: Consider using this library along with {SlotDerivation}.\n */\nlibrary StorageSlot {\n    struct AddressSlot {\n        address value;\n    }\n\n    struct BooleanSlot {\n        bool value;\n    }\n\n    struct Bytes32Slot {\n        bytes32 value;\n    }\n\n    struct Uint256Slot {\n        uint256 value;\n    }\n\n    struct Int256Slot {\n        int256 value;\n    }\n\n    struct StringSlot {\n        string value;\n    }\n\n    struct BytesSlot {\n        bytes value;\n    }\n\n    /**\n     * @dev Returns an `AddressSlot` with member `value` located at `slot`.\n     */\n    function getAddressSlot(bytes32 slot) internal pure returns (AddressSlot storage r) {\n        assembly (\"memory-safe\") {\n            r.slot := slot\n        }\n    }\n\n    /**\n     * @dev Returns a `BooleanSlot` with member `value` located at `slot`.\n     */\n    function getBooleanSlot(bytes32 slot) internal pure returns (BooleanSlot storage r) {\n        assembly (\"memory-safe\") {\n            r.slot := slot\n        }\n    }\n\n    /**\n     * @dev Returns a `Bytes32Slot` with member `value` located at `slot`.\n     */\n    function getBytes32Slot(bytes32 slot) internal pure returns (Bytes32Slot storage r) {\n        assembly (\"memory-safe\") {\n            r.slot := slot\n        }\n    }\n\n    /**\n     * @dev Returns a `Uint256Slot` with member `value` located at `slot`.\n     */\n    function getUint256Slot(bytes32 slot) internal pure returns (Uint256Slot storage r) {\n        assembly (\"memory-safe\") {\n            r.slot := slot\n        }\n    }\n\n    /**\n     * @dev Returns a `Int256Slot` with member `value` located at `slot`.\n     */\n    function getInt256Slot(bytes32 slot) internal pure returns (Int256Slot storage r) {\n        assembly (\"memory-safe\") {\n            r.slot := slot\n        }\n    }\n\n    /**\n     * @dev Returns a `StringSlot` with member `value` located at `slot`.\n     */\n    function getStringSlot(bytes32 slot) internal pure returns (StringSlot storage r) {\n        assembly (\"memory-safe\") {\n            r.slot := slot\n        }\n    }\n\n    /**\n     * @dev Returns an `StringSlot` representation of the string storage pointer `store`.\n     */\n    function getStringSlot(string storage store) internal pure returns (StringSlot storage r) {\n        assembly (\"memory-safe\") {\n            r.slot := store.slot\n        }\n    }\n\n    /**\n     * @dev Returns a `BytesSlot` with member `value` located at `slot`.\n     */\n    function getBytesSlot(bytes32 slot) internal pure returns (BytesSlot storage r) {\n        assembly (\"memory-safe\") {\n            r.slot := slot\n        }\n    }\n\n    /**\n     * @dev Returns an `BytesSlot` representation of the bytes storage pointer `store`.\n     */\n    function getBytesSlot(bytes storage store) internal pure returns (BytesSlot storage r) {\n        assembly (\"memory-safe\") {\n            r.slot := store.slot\n        }\n    }\n}\n"
+      },
+      "@openzeppelin/contracts@5.7.0/access/Ownable2Step.sol": {
+        "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.1.0) (access/Ownable2Step.sol)\n\npragma solidity ^0.8.20;\n\nimport {Ownable} from \"./Ownable.sol\";\n\n/**\n * @dev Contract module which provides access control mechanism, where\n * there is an account (an owner) that can be granted exclusive access to\n * specific functions.\n *\n * This extension of the {Ownable} contract includes a two-step mechanism to transfer\n * ownership, where the new owner must call {acceptOwnership} in order to replace the\n * old one. This can help prevent common mistakes, such as transfers of ownership to\n * incorrect accounts, or to contracts that are unable to interact with the\n * permission system.\n *\n * The initial owner is specified at deployment time in the constructor for `Ownable`. This\n * can later be changed with {transferOwnership} and {acceptOwnership}.\n *\n * This module is used through inheritance. It will make available all functions\n * from parent (Ownable).\n */\nabstract contract Ownable2Step is Ownable {\n    address private _pendingOwner;\n\n    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);\n\n    /**\n     * @dev Returns the address of the pending owner.\n     */\n    function pendingOwner() public view virtual returns (address) {\n        return _pendingOwner;\n    }\n\n    /**\n     * @dev Starts the ownership transfer of the contract to a new account. Replaces the pending transfer if there is one.\n     * Can only be called by the current owner.\n     *\n     * Setting `newOwner` to the zero address is allowed; this can be used to cancel an initiated ownership transfer.\n     */\n    function transferOwnership(address newOwner) public virtual override onlyOwner {\n        _pendingOwner = newOwner;\n        emit OwnershipTransferStarted(owner(), newOwner);\n    }\n\n    /**\n     * @dev Transfers ownership of the contract to a new account (`newOwner`) and deletes any pending owner.\n     * Internal function without access restriction.\n     */\n    function _transferOwnership(address newOwner) internal virtual override {\n        delete _pendingOwner;\n        super._transferOwnership(newOwner);\n    }\n\n    /**\n     * @dev The new owner accepts the ownership transfer.\n     */\n    function acceptOwnership() public virtual {\n        address sender = _msgSender();\n        if (pendingOwner() != sender) {\n            revert OwnableUnauthorizedAccount(sender);\n        }\n        _transferOwnership(sender);\n    }\n}\n"
+      },
+      "@openzeppelin/contracts@5.7.0/utils/ReentrancyGuard.sol": {
+        "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.5.0) (utils/ReentrancyGuard.sol)\n\npragma solidity ^0.8.20;\n\nimport {StorageSlot} from \"./StorageSlot.sol\";\n\n/**\n * @dev Contract module that helps prevent reentrant calls to a function.\n *\n * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier\n * available, which can be applied to functions to make sure there are no nested\n * (reentrant) calls to them.\n *\n * Note that because there is a single `nonReentrant` guard, functions marked as\n * `nonReentrant` may not call one another. This can be worked around by making\n * those functions `private`, and then adding `external` `nonReentrant` entry\n * points to them.\n *\n * TIP: If EIP-1153 (transient storage) is available on the chain you're deploying at,\n * consider using {ReentrancyGuardTransient} instead.\n *\n * TIP: If you would like to learn more about reentrancy and alternative ways\n * to protect against it, check out our blog post\n * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].\n *\n * IMPORTANT: Deprecated. This storage-based reentrancy guard will be removed and replaced\n * by the {ReentrancyGuardTransient} variant in v6.0.\n *\n * @custom:stateless\n */\nabstract contract ReentrancyGuard {\n    using StorageSlot for bytes32;\n\n    // keccak256(abi.encode(uint256(keccak256(\"openzeppelin.storage.ReentrancyGuard\")) - 1)) & ~bytes32(uint256(0xff))\n    bytes32 private constant REENTRANCY_GUARD_STORAGE =\n        0x9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00;\n\n    // Booleans are more expensive than uint256 or any type that takes up a full\n    // word because each write operation emits an extra SLOAD to first read the\n    // slot's contents, replace the bits taken up by the boolean, and then write\n    // back. This is the compiler's defense against contract upgrades and\n    // pointer aliasing, and it cannot be disabled.\n\n    // The values being non-zero value makes deployment a bit more expensive,\n    // but in exchange the refund on every call to nonReentrant will be lower in\n    // amount. Since refunds are capped to a percentage of the total\n    // transaction's gas, it is best to keep them low in cases like this one, to\n    // increase the likelihood of the full refund coming into effect.\n    uint256 private constant NOT_ENTERED = 1;\n    uint256 private constant ENTERED = 2;\n\n    /**\n     * @dev Unauthorized reentrant call.\n     */\n    error ReentrancyGuardReentrantCall();\n\n    constructor() {\n        _reentrancyGuardStorageSlot().getUint256Slot().value = NOT_ENTERED;\n    }\n\n    /**\n     * @dev Prevents a contract from calling itself, directly or indirectly.\n     * Calling a `nonReentrant` function from another `nonReentrant`\n     * function is not supported. It is possible to prevent this from happening\n     * by making the `nonReentrant` function external, and making it call a\n     * `private` function that does the actual work.\n     */\n    modifier nonReentrant() {\n        _nonReentrantBefore();\n        _;\n        _nonReentrantAfter();\n    }\n\n    /**\n     * @dev A `view` only version of {nonReentrant}. Use to block view functions\n     * from being called, preventing reading from inconsistent contract state.\n     *\n     * CAUTION: This is a \"view\" modifier and does not change the reentrancy\n     * status. Use it only on view functions. For payable or non-payable functions,\n     * use the standard {nonReentrant} modifier instead.\n     */\n    modifier nonReentrantView() {\n        _nonReentrantBeforeView();\n        _;\n    }\n\n    function _nonReentrantBeforeView() private view {\n        if (_reentrancyGuardEntered()) {\n            revert ReentrancyGuardReentrantCall();\n        }\n    }\n\n    function _nonReentrantBefore() private {\n        // On the first call to nonReentrant, _status will be NOT_ENTERED\n        _nonReentrantBeforeView();\n\n        // Any calls to nonReentrant after this point will fail\n        _reentrancyGuardStorageSlot().getUint256Slot().value = ENTERED;\n    }\n\n    function _nonReentrantAfter() private {\n        // By storing the original value once again, a refund is triggered (see\n        // https://eips.ethereum.org/EIPS/eip-2200)\n        _reentrancyGuardStorageSlot().getUint256Slot().value = NOT_ENTERED;\n    }\n\n    /**\n     * @dev Returns true if the reentrancy guard is currently set to \"entered\", which indicates there is a\n     * `nonReentrant` function in the call stack.\n     */\n    function _reentrancyGuardEntered() internal view returns (bool) {\n        return _reentrancyGuardStorageSlot().getUint256Slot().value == ENTERED;\n    }\n\n    function _reentrancyGuardStorageSlot() internal pure virtual returns (bytes32) {\n        return REENTRANCY_GUARD_STORAGE;\n    }\n}\n"
+      }
+    },
+    "language": "Solidity",
+    "settings": {
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "cancun",
+      "remappings": [],
+      "outputSelection": {
+        "*": {
+          "": [
+            "*"
+          ],
+          "*": [
+            "*"
+          ]
+        }
+      }
+    }
+  },
+  "compiler_lang": "Solidity",
+  "compiler_type": "json",
+  "createtime": "2026-09-07T10:41:11.000Z",
+  "ouput_json": {
+    "abi": [
+      {
+        "type": "constructor",
+        "inputs": [],
+        "stateMutability": "nonpayable"
+      },
+      {
+        "name": "AlreadyCheckedInToday",
+        "type": "error",
+        "inputs": []
+      },
+      {
+        "name": "EnforcedPause",
+        "type": "error",
+        "inputs": []
+      },
+      {
+        "name": "ExpectedPause",
+        "type": "error",
+        "inputs": []
+      },
+      {
+        "name": "InsufficientCredits",
+        "type": "error",
+        "inputs": []
+      },
+      {
+        "name": "InsufficientNativeBalance",
+        "type": "error",
+        "inputs": []
+      },
+      {
+        "name": "InvalidRecipient",
+        "type": "error",
+        "inputs": []
+      },
+      {
+        "name": "InvalidRewardConfiguration",
+        "type": "error",
+        "inputs": []
+      },
+      {
+        "name": "NativeTransferFailed",
+        "type": "error",
+        "inputs": []
+      },
+      {
+        "name": "OwnableInvalidOwner",
+        "type": "error",
+        "inputs": [
+          {
+            "name": "owner",
+            "type": "address",
+            "internalType": "address"
+          }
+        ]
+      },
+      {
+        "name": "OwnableUnauthorizedAccount",
+        "type": "error",
+        "inputs": [
+          {
+            "name": "account",
+            "type": "address",
+            "internalType": "address"
+          }
+        ]
+      },
+      {
+        "name": "ReentrancyGuardReentrantCall",
+        "type": "error",
+        "inputs": []
+      },
+      {
+        "name": "ZeroAmount",
+        "type": "error",
+        "inputs": []
+      },
+      {
+        "name": "CheckedIn",
+        "type": "event",
+        "inputs": [
+          {
+            "name": "user",
+            "type": "address",
+            "indexed": true,
+            "internalType": "address"
+          },
+          {
+            "name": "dayIndex",
+            "type": "uint256",
+            "indexed": true,
+            "internalType": "uint256"
+          },
+          {
+            "name": "streak",
+            "type": "uint256",
+            "indexed": false,
+            "internalType": "uint256"
+          },
+          {
+            "name": "credits",
+            "type": "uint256",
+            "indexed": false,
+            "internalType": "uint256"
+          }
+        ],
+        "anonymous": false
+      },
+      {
+        "name": "CreditsSpent",
+        "type": "event",
+        "inputs": [
+          {
+            "name": "user",
+            "type": "address",
+            "indexed": true,
+            "internalType": "address"
+          },
+          {
+            "name": "amount",
+            "type": "uint256",
+            "indexed": false,
+            "internalType": "uint256"
+          },
+          {
+            "name": "remainingCredits",
+            "type": "uint256",
+            "indexed": false,
+            "internalType": "uint256"
+          }
+        ],
+        "anonymous": false
+      },
+      {
+        "name": "NativeReceived",
+        "type": "event",
+        "inputs": [
+          {
+            "name": "sender",
+            "type": "address",
+            "indexed": true,
+            "internalType": "address"
+          },
+          {
+            "name": "amount",
+            "type": "uint256",
+            "indexed": false,
+            "internalType": "uint256"
+          }
+        ],
+        "anonymous": false
+      },
+      {
+        "name": "NativeWithdrawn",
+        "type": "event",
+        "inputs": [
+          {
+            "name": "recipient",
+            "type": "address",
+            "indexed": true,
+            "internalType": "address"
+          },
+          {
+            "name": "amount",
+            "type": "uint256",
+            "indexed": false,
+            "internalType": "uint256"
+          }
+        ],
+        "anonymous": false
+      },
+      {
+        "name": "OwnershipTransferStarted",
+        "type": "event",
+        "inputs": [
+          {
+            "name": "previousOwner",
+            "type": "address",
+            "indexed": true,
+            "internalType": "address"
+          },
+          {
+            "name": "newOwner",
+            "type": "address",
+            "indexed": true,
+            "internalType": "address"
+          }
+        ],
+        "anonymous": false
+      },
+      {
+        "name": "OwnershipTransferred",
+        "type": "event",
+        "inputs": [
+          {
+            "name": "previousOwner",
+            "type": "address",
+            "indexed": true,
+            "internalType": "address"
+          },
+          {
+            "name": "newOwner",
+            "type": "address",
+            "indexed": true,
+            "internalType": "address"
+          }
+        ],
+        "anonymous": false
+      },
+      {
+        "name": "Paused",
+        "type": "event",
+        "inputs": [
+          {
+            "name": "account",
+            "type": "address",
+            "indexed": false,
+            "internalType": "address"
+          }
+        ],
+        "anonymous": false
+      },
+      {
+        "name": "RewardSettingsUpdated",
+        "type": "event",
+        "inputs": [
+          {
+            "name": "baseReward",
+            "type": "uint256",
+            "indexed": false,
+            "internalType": "uint256"
+          },
+          {
+            "name": "streakRewardIncrement",
+            "type": "uint256",
+            "indexed": false,
+            "internalType": "uint256"
+          },
+          {
+            "name": "weeklyBonusThreshold",
+            "type": "uint256",
+            "indexed": false,
+            "internalType": "uint256"
+          },
+          {
+            "name": "monthlyBonusThreshold",
+            "type": "uint256",
+            "indexed": false,
+            "internalType": "uint256"
+          },
+          {
+            "name": "weeklyBonus",
+            "type": "uint256",
+            "indexed": false,
+            "internalType": "uint256"
+          },
+          {
+            "name": "monthlyBonus",
+            "type": "uint256",
+            "indexed": false,
+            "internalType": "uint256"
+          }
+        ],
+        "anonymous": false
+      },
+      {
+        "name": "StreakBonusAwarded",
+        "type": "event",
+        "inputs": [
+          {
+            "name": "user",
+            "type": "address",
+            "indexed": true,
+            "internalType": "address"
+          },
+          {
+            "name": "dayIndex",
+            "type": "uint256",
+            "indexed": true,
+            "internalType": "uint256"
+          },
+          {
+            "name": "streak",
+            "type": "uint256",
+            "indexed": false,
+            "internalType": "uint256"
+          },
+          {
+            "name": "bonus",
+            "type": "uint256",
+            "indexed": false,
+            "internalType": "uint256"
+          }
+        ],
+        "anonymous": false
+      },
+      {
+        "name": "Unpaused",
+        "type": "event",
+        "inputs": [
+          {
+            "name": "account",
+            "type": "address",
+            "indexed": false,
+            "internalType": "address"
+          }
+        ],
+        "anonymous": false
+      },
+      {
+        "name": "acceptOwnership",
+        "type": "function",
+        "inputs": [],
+        "outputs": [],
+        "stateMutability": "nonpayable"
+      },
+      {
+        "name": "baseReward",
+        "type": "function",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "uint256",
+            "value": "10",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "calculateMilestoneBonus",
+        "type": "function",
+        "inputs": [
+          {
+            "name": "streak",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "bonus",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "calculateReward",
+        "type": "function",
+        "inputs": [
+          {
+            "name": "streak",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "canCheckIn",
+        "type": "function",
+        "inputs": [
+          {
+            "name": "account",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "",
+            "type": "bool",
+            "internalType": "bool"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "checkIn",
+        "type": "function",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "streak",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "credits",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "payable"
+      },
+      {
+        "name": "currentDay",
+        "type": "function",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "uint256",
+            "value": "20703",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "dailyStats",
+        "type": "function",
+        "inputs": [
+          {
+            "name": "",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "checkIns",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "creditsIssued",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "getUserStatus",
+        "type": "function",
+        "inputs": [
+          {
+            "name": "account",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "lastCheckInDay",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "currentStreak",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "longestStreak",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "userTotalCheckIns",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "totalCredits",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "availableCredits",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "canCheckInToday",
+            "type": "bool",
+            "internalType": "bool"
+          },
+          {
+            "name": "nextStreak",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "nextReward",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "hasCheckedInOnDay",
+        "type": "function",
+        "inputs": [
+          {
+            "name": "",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "",
+            "type": "bool",
+            "internalType": "bool"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "monthlyBonus",
+        "type": "function",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "uint256",
+            "value": "200",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "monthlyBonusThreshold",
+        "type": "function",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "uint256",
+            "value": "30",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "owner",
+        "type": "function",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "address",
+            "value": "0xD6aC93785EFD789649831f5753E9F33EC6185cE8",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "pause",
+        "type": "function",
+        "inputs": [],
+        "outputs": [],
+        "stateMutability": "nonpayable"
+      },
+      {
+        "name": "paused",
+        "type": "function",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "bool",
+            "value": false,
+            "internalType": "bool"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "pendingOwner",
+        "type": "function",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "address",
+            "value": "0x0000000000000000000000000000000000000000",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "previewNextReward",
+        "type": "function",
+        "inputs": [
+          {
+            "name": "account",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "previewNextStreak",
+        "type": "function",
+        "inputs": [
+          {
+            "name": "account",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "renounceOwnership",
+        "type": "function",
+        "inputs": [],
+        "outputs": [],
+        "stateMutability": "nonpayable"
+      },
+      {
+        "name": "setRewardSettings",
+        "type": "function",
+        "inputs": [
+          {
+            "name": "newBaseReward",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "newStreakRewardIncrement",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "newWeeklyBonusThreshold",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "newMonthlyBonusThreshold",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "newWeeklyBonus",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "newMonthlyBonus",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "outputs": [],
+        "stateMutability": "nonpayable"
+      },
+      {
+        "name": "spendCredits",
+        "type": "function",
+        "inputs": [
+          {
+            "name": "amount",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "outputs": [],
+        "stateMutability": "nonpayable"
+      },
+      {
+        "name": "streakRewardIncrement",
+        "type": "function",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "uint256",
+            "value": "2",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "totalCheckIns",
+        "type": "function",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "uint256",
+            "value": "0",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "totalCreditsIssued",
+        "type": "function",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "uint256",
+            "value": "0",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "totalUsers",
+        "type": "function",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "uint256",
+            "value": "0",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "transferOwnership",
+        "type": "function",
+        "inputs": [
+          {
+            "name": "newOwner",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "outputs": [],
+        "stateMutability": "nonpayable"
+      },
+      {
+        "name": "unpause",
+        "type": "function",
+        "inputs": [],
+        "outputs": [],
+        "stateMutability": "nonpayable"
+      },
+      {
+        "name": "users",
+        "type": "function",
+        "inputs": [
+          {
+            "name": "",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "lastCheckInDay",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "currentStreak",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "longestStreak",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "totalCheckIns",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "totalCredits",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "availableCredits",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "weeklyBonus",
+        "type": "function",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "uint256",
+            "value": "50",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "weeklyBonusThreshold",
+        "type": "function",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "uint256",
+            "value": "7",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "name": "withdrawNative",
+        "type": "function",
+        "inputs": [
+          {
+            "name": "recipient",
+            "type": "address",
+            "internalType": "address payable"
+          },
+          {
+            "name": "amount",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "outputs": [],
+        "stateMutability": "nonpayable"
+      },
+      {
+        "type": "receive",
+        "stateMutability": "payable"
+      }
+    ],
+    "status": "perfect",
+    "address": "0x843e4ff9242c3e81b676434b2876fb090d4a5783",
+    "license": "MIT",
+    "tx_hash": "0x8df5f7382fb3a6d6c06afaabee90919522fe596cc8c6b2a9c5f72991fb64c6f9",
+    "bytecode": "0x6080604052600436106101d3575f3560e01c80638456cb59116100fd578063d2d7231f11610092578063ea0d5dcd11610062578063ea0d5dcd14610589578063edc7e9b9146105ee578063f2fde38b14610603578063fb89684814610622575f5ffd5b8063d2d7231f14610519578063d820901514610538578063e26ac25b14610557578063e30c39781461056c575f5ffd5b8063a9e6f7c3116100cd578063a9e6f7c3146104b1578063ba2b76ae146104d0578063bff1f9e1146104e5578063c5f0861e146104fa575f5ffd5b80638456cb59146103db5780638da5cb5b146103ef578063a563eaa31461041f578063a87430ba14610434575f5ffd5b80635c9302c91161017357806375e1e4371161014357806375e1e4371461035a57806376ad03bc1461037957806379ba50971461038e5780637a85604e146103a2575f5ffd5b80635c9302c9146102f35780635c975abb1461030757806365375d0514610331578063715018a614610346575f5ffd5b80632008d7a0116101ae5780632008d7a0146102755780632c489aec146102985780633f4ba83a146102ca578063584fb5e2146102de575f5ffd5b806307b18bde1461021357806307b6f64214610234578063183ff08514610253575f5ffd5b3661020f5760405134815233907f8ac633e5b094e1150d2a6495df4d0c77f51d293abe99e7733c78870dfbee76609060200160405180910390a2005b5f5ffd5b34801561021e575f5ffd5b5061023261022d366004611111565b610641565b005b34801561023f575f5ffd5b5061023261024e36600461113b565b610787565b61025b610834565b604080519283526020830191909152015b60405180910390f35b348015610280575f5ffd5b5061028a60075481565b60405190815260200161026c565b3480156102a3575f5ffd5b5061025b6102b236600461117a565b60046020525f90815260409020805460019091015482565b3480156102d5575f5ffd5b50610232610afd565b3480156102e9575f5ffd5b5061028a600b5481565b3480156102fe575f5ffd5b5061028a610b0f565b348015610312575f5ffd5b50600154600160a01b900460ff165b604051901515815260200161026c565b34801561033c575f5ffd5b5061028a60095481565b348015610351575f5ffd5b50610232610b22565b348015610365575f5ffd5b5061028a610374366004611191565b610b33565b348015610384575f5ffd5b5061028a60085481565b348015610399575f5ffd5b50610232610bd6565b3480156103ad575f5ffd5b506103216103bc366004611111565b600360209081525f928352604080842090915290825290205460ff1681565b3480156103e6575f5ffd5b50610232610c1f565b3480156103fa575f5ffd5b505f546001600160a01b03165b6040516001600160a01b03909116815260200161026c565b34801561042a575f5ffd5b5061028a60065481565b34801561043f575f5ffd5b5061048461044e366004611191565b600260208190525f9182526040909120805460018201549282015460038301546004840154600590940154929493919290919086565b604080519687526020870195909552938501929092526060840152608083015260a082015260c00161026c565b3480156104bc575f5ffd5b506102326104cb36600461117a565b610c2f565b3480156104db575f5ffd5b5061028a600d5481565b3480156104f0575f5ffd5b5061028a60055481565b348015610505575f5ffd5b5061028a61051436600461117a565b610d07565b348015610524575f5ffd5b5061028a61053336600461117a565b610d6d565b348015610543575f5ffd5b5061028a610552366004611191565b610dbf565b348015610562575f5ffd5b5061028a600a5481565b348015610577575f5ffd5b506001546001600160a01b0316610407565b348015610594575f5ffd5b506105a86105a3366004611191565b610de0565b60408051998a5260208a0198909852968801959095526060870193909352608086019190915260a0850152151560c084015260e08301526101008201526101200161026c565b3480156105f9575f5ffd5b5061028a600c5481565b34801561060e575f5ffd5b5061023261061d366004611191565b610e88565b34801561062d575f5ffd5b5061032161063c366004611191565b610ef8565b610649610f32565b610651610f5e565b6001600160a01b03821661067857604051634e46966960e11b815260040160405180910390fd5b805f0361069857604051631f2a200560e01b815260040160405180910390fd5b478111156106b95760405163dbc3a71f60e01b815260040160405180910390fd5b5f826001600160a01b0316826040515f6040518083038185875af1925050503d805f8114610702576040519150601f19603f3d011682016040523d82523d5f602084013e610707565b606091505b505090508061072957604051633d2cec6f60e21b815260040160405180910390fd5b826001600160a01b03167fc303ca808382409472acbbf899c316cf439f409f6584aae22df86dfa3c9ed5048360405161076491815260200190565b60405180910390a25061078360015f51602061123e5f395f51905f5255565b5050565b61078f610f32565b83158061079a575082155b156107b857604051632a6b597d60e21b815260040160405180910390fd5b60088690556009859055600a849055600b839055600c829055600d8190556040805187815260208101879052908101859052606081018490526080810183905260a081018290527f34015a1fd901db1b884a4f94572b8028816db13910a248621833a21e648943b29060c00160405180910390a1505050505050565b5f5f61083e610f79565b610846610f5e565b5f61084f610b0f565b335f90815260036020908152604080832084845290915290205490915060ff161561088d5760405163d3d38ea760e01b815260040160405180910390fd5b335f90815260026020526040812060038101549091036108bf57600160055f8282546108b991906111c0565b90915550505b5f81600301545f036108d357506001610901565b815483906108e29060016111c0565b036108fd576001808301546108f6916111c0565b9050610901565b5060015b5f61090b82610d6d565b848455600180850184905560038501805492935090915f9061092e9084906111c0565b9091555050600283015482111561094757600283018290555b80836004015f82825461095a91906111c0565b9250508190555080836005015f82825461097491906111c0565b9091555050335f9081526003602090815260408083208784529091528120805460ff1916600190811790915560068054919290916109b39084906111c0565b925050819055508060075f8282546109cb91906111c0565b90915550505f848152600460205260408120805490916001918391906109f29084906111c0565b9250508190555081816001015f828254610a0c91906111c0565b90915550506040805184815260208101849052869133917f7e4c1be4a7f9736334ae1a21a54b75fe0b8ac49d1c72b89a21ec4802d4f6fabb910160405180910390a35f610a5884610d07565b90508015610a9e576040805185815260208101839052879133917fdad0612877648c23cf0fe0fb6ec3e1ec30db66871e93ae9bd66020a8e7b4bd96910160405180910390a35b3415610ada5760405134815233907f8ac633e5b094e1150d2a6495df4d0c77f51d293abe99e7733c78870dfbee76609060200160405180910390a25b509195509350505050610af960015f51602061123e5f395f51905f5255565b9091565b610b05610f32565b610b0d610fa4565b565b5f610b1d62015180426111ed565b905090565b610b2a610f32565b610b0d5f610ff9565b6001600160a01b0381165f90815260026020526040812081610b53610b0f565b6001600160a01b0385165f90815260036020908152604080832084845290915290205490915060ff1615610b8c57506001015492915050565b81600301545f03610ba1575060019392505050565b81548190610bb09060016111c0565b03610bcc57600180830154610bc4916111c0565b949350505050565b5060019392505050565b60015433906001600160a01b03168114610c135760405163118cdaa760e01b81526001600160a01b03821660048201526024015b60405180910390fd5b610c1c81610ff9565b50565b610c27610f32565b610b0d611012565b610c37610f79565b610c3f610f5e565b805f03610c5f57604051631f2a200560e01b815260040160405180910390fd5b335f9081526002602052604090206005810154821115610c92576040516343fb945360e01b815260040160405180910390fd5b81816005015f828254610ca59190611200565b9091555050600581015460405133917f8731f031147ae73bef11efcf4e8802d6cbc9626d627cd22c8f31a56109dd278791610ce891868252602082015260400190565b60405180910390a250610c1c60015f51602061123e5f395f51905f5255565b5f5f600a54118015610d235750600a54610d219083611213565b155b15610d3857600c54610d3590826111c0565b90505b5f600b54118015610d535750600b54610d519083611213565b155b15610d6857600d54610d6590826111c0565b90505b919050565b5f815f03610d7c57505f919050565b6009545f90610d8c600185611200565b610d969190611226565b600854610da391906111c0565b9050610dae83610d07565b610db890826111c0565b9392505050565b5f610dc982610ef8565b610dd457505f919050565b610d6561053383610b33565b6001600160a01b0381165f9081526002602052604081208190819081908190819081908190819081610e118c610ef8565b90505f81610e23578260010154610e2c565b610e2c8d610b33565b90505f82610e3a575f610e43565b610e4382610d6d565b9050835f0154846001015485600201548660030154876004015488600501548888889c509c509c509c509c509c509c509c509c50505050509193959799909294969850565b610e90610f32565b600180546001600160a01b0383166001600160a01b03199091168117909155610ec05f546001600160a01b031690565b6001600160a01b03167f38d16b8cac22d99fc7c124b9cd0de2d3fa1faef420bfe791d8c362d765e2270060405160405180910390a350565b6001600160a01b0381165f90815260036020526040812081610f18610b0f565b815260208101919091526040015f205460ff161592915050565b5f546001600160a01b03163314610b0d5760405163118cdaa760e01b8152336004820152602401610c0a565b610f66611055565b60025f51602061123e5f395f51905f5255565b600154600160a01b900460ff1615610b0d5760405163d93c066560e01b815260040160405180910390fd5b610fac611084565b6001805460ff60a01b191690557f5db9ee0a495bf2e6ff9c91a7834c1ba4fdd244a5e8aa4e537bd38aeae4b073aa335b6040516001600160a01b03909116815260200160405180910390a1565b600180546001600160a01b0319169055610c1c816110ae565b61101a610f79565b6001805460ff60a01b1916600160a01b1790557f62e78cea01bee320cd4e420270b5ea74000d11b0c9f74754ebdbfc544b05a258610fdc3390565b5f51602061123e5f395f51905f5254600203610b0d57604051633ee5aeb560e01b815260040160405180910390fd5b600154600160a01b900460ff16610b0d57604051638dfc202b60e01b815260040160405180910390fd5b5f80546001600160a01b038381166001600160a01b0319831681178455604051919092169283917f8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e09190a35050565b6001600160a01b0381168114610c1c575f5ffd5b5f5f60408385031215611122575f5ffd5b823561112d816110fd565b946020939093013593505050565b5f5f5f5f5f5f60c08789031215611150575f5ffd5b505084359660208601359650604086013595606081013595506080810135945060a0013592509050565b5f6020828403121561118a575f5ffd5b5035919050565b5f602082840312156111a1575f5ffd5b8135610db8816110fd565b634e487b7160e01b5f52601160045260245ffd5b808201808211156111d3576111d36111ac565b92915050565b634e487b7160e01b5f52601260045260245ffd5b5f826111fb576111fb6111d9565b500490565b818103818111156111d3576111d36111ac565b5f82611221576112216111d9565b500690565b80820281158282048414176111d3576111d36111ac56fe9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00a26469706673582212209f50b7493df79c42018fa12de184386827a5cc5cd89602f7041350bd157d7d9964736f6c63430008240033",
+    "libraryMap": {},
+    "evm_version": "cancun",
+    "swarmSource": "/ipfs/QmZ4YvG4bit3CAv7hQuQvLuSCn6fq9q2nCiCwhVWhrT4kG",
+    "contractName": "MPCCheckinCore",
+    "creationCode": "0x6080604052600a60085560026009556007600a55601e600b556032600c5560c8600d5534801561002d575f5ffd5b50338061005357604051631e4fbdf760e01b81525f600482015260240160405180910390fd5b61005c81610086565b5060017f9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00556100f1565b600180546001600160a01b031916905561009f816100a2565b50565b5f80546001600160a01b038381166001600160a01b0319831681178455604051919092169283917f8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e09190a35050565b611293806100fe5f395ff3fe6080604052600436106101d3575f3560e01c80638456cb59116100fd578063d2d7231f11610092578063ea0d5dcd11610062578063ea0d5dcd14610589578063edc7e9b9146105ee578063f2fde38b14610603578063fb89684814610622575f5ffd5b8063d2d7231f14610519578063d820901514610538578063e26ac25b14610557578063e30c39781461056c575f5ffd5b8063a9e6f7c3116100cd578063a9e6f7c3146104b1578063ba2b76ae146104d0578063bff1f9e1146104e5578063c5f0861e146104fa575f5ffd5b80638456cb59146103db5780638da5cb5b146103ef578063a563eaa31461041f578063a87430ba14610434575f5ffd5b80635c9302c91161017357806375e1e4371161014357806375e1e4371461035a57806376ad03bc1461037957806379ba50971461038e5780637a85604e146103a2575f5ffd5b80635c9302c9146102f35780635c975abb1461030757806365375d0514610331578063715018a614610346575f5ffd5b80632008d7a0116101ae5780632008d7a0146102755780632c489aec146102985780633f4ba83a146102ca578063584fb5e2146102de575f5ffd5b806307b18bde1461021357806307b6f64214610234578063183ff08514610253575f5ffd5b3661020f5760405134815233907f8ac633e5b094e1150d2a6495df4d0c77f51d293abe99e7733c78870dfbee76609060200160405180910390a2005b5f5ffd5b34801561021e575f5ffd5b5061023261022d366004611111565b610641565b005b34801561023f575f5ffd5b5061023261024e36600461113b565b610787565b61025b610834565b604080519283526020830191909152015b60405180910390f35b348015610280575f5ffd5b5061028a60075481565b60405190815260200161026c565b3480156102a3575f5ffd5b5061025b6102b236600461117a565b60046020525f90815260409020805460019091015482565b3480156102d5575f5ffd5b50610232610afd565b3480156102e9575f5ffd5b5061028a600b5481565b3480156102fe575f5ffd5b5061028a610b0f565b348015610312575f5ffd5b50600154600160a01b900460ff165b604051901515815260200161026c565b34801561033c575f5ffd5b5061028a60095481565b348015610351575f5ffd5b50610232610b22565b348015610365575f5ffd5b5061028a610374366004611191565b610b33565b348015610384575f5ffd5b5061028a60085481565b348015610399575f5ffd5b50610232610bd6565b3480156103ad575f5ffd5b506103216103bc366004611111565b600360209081525f928352604080842090915290825290205460ff1681565b3480156103e6575f5ffd5b50610232610c1f565b3480156103fa575f5ffd5b505f546001600160a01b03165b6040516001600160a01b03909116815260200161026c565b34801561042a575f5ffd5b5061028a60065481565b34801561043f575f5ffd5b5061048461044e366004611191565b600260208190525f9182526040909120805460018201549282015460038301546004840154600590940154929493919290919086565b604080519687526020870195909552938501929092526060840152608083015260a082015260c00161026c565b3480156104bc575f5ffd5b506102326104cb36600461117a565b610c2f565b3480156104db575f5ffd5b5061028a600d5481565b3480156104f0575f5ffd5b5061028a60055481565b348015610505575f5ffd5b5061028a61051436600461117a565b610d07565b348015610524575f5ffd5b5061028a61053336600461117a565b610d6d565b348015610543575f5ffd5b5061028a610552366004611191565b610dbf565b348015610562575f5ffd5b5061028a600a5481565b348015610577575f5ffd5b506001546001600160a01b0316610407565b348015610594575f5ffd5b506105a86105a3366004611191565b610de0565b60408051998a5260208a0198909852968801959095526060870193909352608086019190915260a0850152151560c084015260e08301526101008201526101200161026c565b3480156105f9575f5ffd5b5061028a600c5481565b34801561060e575f5ffd5b5061023261061d366004611191565b610e88565b34801561062d575f5ffd5b5061032161063c366004611191565b610ef8565b610649610f32565b610651610f5e565b6001600160a01b03821661067857604051634e46966960e11b815260040160405180910390fd5b805f0361069857604051631f2a200560e01b815260040160405180910390fd5b478111156106b95760405163dbc3a71f60e01b815260040160405180910390fd5b5f826001600160a01b0316826040515f6040518083038185875af1925050503d805f8114610702576040519150601f19603f3d011682016040523d82523d5f602084013e610707565b606091505b505090508061072957604051633d2cec6f60e21b815260040160405180910390fd5b826001600160a01b03167fc303ca808382409472acbbf899c316cf439f409f6584aae22df86dfa3c9ed5048360405161076491815260200190565b60405180910390a25061078360015f51602061123e5f395f51905f5255565b5050565b61078f610f32565b83158061079a575082155b156107b857604051632a6b597d60e21b815260040160405180910390fd5b60088690556009859055600a849055600b839055600c829055600d8190556040805187815260208101879052908101859052606081018490526080810183905260a081018290527f34015a1fd901db1b884a4f94572b8028816db13910a248621833a21e648943b29060c00160405180910390a1505050505050565b5f5f61083e610f79565b610846610f5e565b5f61084f610b0f565b335f90815260036020908152604080832084845290915290205490915060ff161561088d5760405163d3d38ea760e01b815260040160405180910390fd5b335f90815260026020526040812060038101549091036108bf57600160055f8282546108b991906111c0565b90915550505b5f81600301545f036108d357506001610901565b815483906108e29060016111c0565b036108fd576001808301546108f6916111c0565b9050610901565b5060015b5f61090b82610d6d565b848455600180850184905560038501805492935090915f9061092e9084906111c0565b9091555050600283015482111561094757600283018290555b80836004015f82825461095a91906111c0565b9250508190555080836005015f82825461097491906111c0565b9091555050335f9081526003602090815260408083208784529091528120805460ff1916600190811790915560068054919290916109b39084906111c0565b925050819055508060075f8282546109cb91906111c0565b90915550505f848152600460205260408120805490916001918391906109f29084906111c0565b9250508190555081816001015f828254610a0c91906111c0565b90915550506040805184815260208101849052869133917f7e4c1be4a7f9736334ae1a21a54b75fe0b8ac49d1c72b89a21ec4802d4f6fabb910160405180910390a35f610a5884610d07565b90508015610a9e576040805185815260208101839052879133917fdad0612877648c23cf0fe0fb6ec3e1ec30db66871e93ae9bd66020a8e7b4bd96910160405180910390a35b3415610ada5760405134815233907f8ac633e5b094e1150d2a6495df4d0c77f51d293abe99e7733c78870dfbee76609060200160405180910390a25b509195509350505050610af960015f51602061123e5f395f51905f5255565b9091565b610b05610f32565b610b0d610fa4565b565b5f610b1d62015180426111ed565b905090565b610b2a610f32565b610b0d5f610ff9565b6001600160a01b0381165f90815260026020526040812081610b53610b0f565b6001600160a01b0385165f90815260036020908152604080832084845290915290205490915060ff1615610b8c57506001015492915050565b81600301545f03610ba1575060019392505050565b81548190610bb09060016111c0565b03610bcc57600180830154610bc4916111c0565b949350505050565b5060019392505050565b60015433906001600160a01b03168114610c135760405163118cdaa760e01b81526001600160a01b03821660048201526024015b60405180910390fd5b610c1c81610ff9565b50565b610c27610f32565b610b0d611012565b610c37610f79565b610c3f610f5e565b805f03610c5f57604051631f2a200560e01b815260040160405180910390fd5b335f9081526002602052604090206005810154821115610c92576040516343fb945360e01b815260040160405180910390fd5b81816005015f828254610ca59190611200565b9091555050600581015460405133917f8731f031147ae73bef11efcf4e8802d6cbc9626d627cd22c8f31a56109dd278791610ce891868252602082015260400190565b60405180910390a250610c1c60015f51602061123e5f395f51905f5255565b5f5f600a54118015610d235750600a54610d219083611213565b155b15610d3857600c54610d3590826111c0565b90505b5f600b54118015610d535750600b54610d519083611213565b155b15610d6857600d54610d6590826111c0565b90505b919050565b5f815f03610d7c57505f919050565b6009545f90610d8c600185611200565b610d969190611226565b600854610da391906111c0565b9050610dae83610d07565b610db890826111c0565b9392505050565b5f610dc982610ef8565b610dd457505f919050565b610d6561053383610b33565b6001600160a01b0381165f9081526002602052604081208190819081908190819081908190819081610e118c610ef8565b90505f81610e23578260010154610e2c565b610e2c8d610b33565b90505f82610e3a575f610e43565b610e4382610d6d565b9050835f0154846001015485600201548660030154876004015488600501548888889c509c509c509c509c509c509c509c509c50505050509193959799909294969850565b610e90610f32565b600180546001600160a01b0383166001600160a01b03199091168117909155610ec05f546001600160a01b031690565b6001600160a01b03167f38d16b8cac22d99fc7c124b9cd0de2d3fa1faef420bfe791d8c362d765e2270060405160405180910390a350565b6001600160a01b0381165f90815260036020526040812081610f18610b0f565b815260208101919091526040015f205460ff161592915050565b5f546001600160a01b03163314610b0d5760405163118cdaa760e01b8152336004820152602401610c0a565b610f66611055565b60025f51602061123e5f395f51905f5255565b600154600160a01b900460ff1615610b0d5760405163d93c066560e01b815260040160405180910390fd5b610fac611084565b6001805460ff60a01b191690557f5db9ee0a495bf2e6ff9c91a7834c1ba4fdd244a5e8aa4e537bd38aeae4b073aa335b6040516001600160a01b03909116815260200160405180910390a1565b600180546001600160a01b0319169055610c1c816110ae565b61101a610f79565b6001805460ff60a01b1916600160a01b1790557f62e78cea01bee320cd4e420270b5ea74000d11b0c9f74754ebdbfc544b05a258610fdc3390565b5f51602061123e5f395f51905f5254600203610b0d57604051633ee5aeb560e01b815260040160405180910390fd5b600154600160a01b900460ff16610b0d57604051638dfc202b60e01b815260040160405180910390fd5b5f80546001600160a01b038381166001600160a01b0319831681178455604051919092169283917f8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e09190a35050565b6001600160a01b0381168114610c1c575f5ffd5b5f5f60408385031215611122575f5ffd5b823561112d816110fd565b946020939093013593505050565b5f5f5f5f5f5f60c08789031215611150575f5ffd5b505084359660208601359650604086013595606081013595506080810135945060a0013592509050565b5f6020828403121561118a575f5ffd5b5035919050565b5f602082840312156111a1575f5ffd5b8135610db8816110fd565b634e487b7160e01b5f52601160045260245ffd5b808201808211156111d3576111d36111ac565b92915050565b634e487b7160e01b5f52601260045260245ffd5b5f826111fb576111fb6111d9565b500490565b818103818111156111d3576111d36111ac565b5f82611221576112216111d9565b500690565b80820281158282048414176111d3576111d36111ac56fe9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00a26469706673582212209f50b7493df79c42018fa12de184386827a5cc5cd89602f7041350bd157d7d9964736f6c63430008240033",
+    "compiler_version": "v0.8.36+commit.8a079791",
+    "bytecodeSourcemap": "843:14708:6:-:0;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;15471:71;;15523:9;160:25:7;;15499:10:6;;15471:71;;148:2:7;133:18;15471:71:6;;;;;;;843:14708;;;;;14655:688;;;;;;;;;;-1:-1:-1;14655:688:6;;;;;:::i;:::-;;:::i;:::-;;12852:1078;;;;;;;;;;-1:-1:-1;12852:1078:6;;;;;:::i;:::-;;:::i;4863:2671::-;;;:::i;:::-;;;;1736:25:7;;;1792:2;1777:18;;1770:34;;;;1709:18;4863:2671:6;;;;;;;;2099:33;;;;;;;;;;;;;;;;;;;160:25:7;;;148:2;133:18;2099:33:6;14:177:7;1794:47:6;;;;;;;;;;-1:-1:-1;1794:47:6;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;14312:85;;;;;;;;;;;;;:::i;2600:41::-;;;;;;;;;;;;;;;;9101:128;;;;;;;;;;;;;:::i;1726:84:3:-;;;;;;;;;;-1:-1:-1;1796:7:3;;-1:-1:-1;;;1796:7:3;;;;1726:84;;;2211:14:7;;2204:22;2186:41;;2174:2;2159:18;1726:84:3;2046:187:7;2458:40:6;;;;;;;;;;;;;;;;2293:101:0;;;;;;;;;;;;;:::i;9581:588:6:-;;;;;;;;;;-1:-1:-1;9581:588:6;;;;;:::i;:::-;;:::i;2363:30::-;;;;;;;;;;;;;;;;2244:229:1;;;;;;;;;;;;;:::i;1689:69:6:-;;;;;;;;;;-1:-1:-1;1689:69:6;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;14169:81;;;;;;;;;;;;;:::i;1638:85:0:-;;;;;;;;;;-1:-1:-1;1684:7:0;1710:6;-1:-1:-1;;;;;1710:6:0;1638:85;;;-1:-1:-1;;;;;3042:32:7;;;3024:51;;3012:2;2997:18;1638:85:0;2878:203:7;2065:28:6;;;;;;;;;;;;;;;;1595:41;;;;;;;;;;-1:-1:-1;1595:41:6;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;3373:25:7;;;3429:2;3414:18;;3407:34;;;;3457:18;;;3450:34;;;;3515:2;3500:18;;3493:34;3558:3;3543:19;;3536:35;3602:3;3587:19;;3580:35;3360:3;3345:19;1595:41:6;3086:535:7;12057:537:6;;;;;;;;;;-1:-1:-1;12057:537:6;;;;;:::i;:::-;;:::i;2743:33::-;;;;;;;;;;;;;;;;2034:25;;;;;;;;;;;;;;;;8405:450;;;;;;;;;;-1:-1:-1;8405:450:6;;;;;:::i;:::-;;:::i;7981:358::-;;;;;;;;;;-1:-1:-1;7981:358:6;;;;;:::i;:::-;;:::i;10245:276::-;;;;;;;;;;-1:-1:-1;10245:276:6;;;;;:::i;:::-;;:::i;2529:39::-;;;;;;;;;;;;;;;;1232:99:1;;;;;;;;;;-1:-1:-1;1311:13:1;;-1:-1:-1;;;;;1311:13:1;1232:99;;10602:1164:6;;;;;;;;;;-1:-1:-1;10602:1164:6;;;;;:::i;:::-;;:::i;:::-;;;;3991:25:7;;;4047:2;4032:18;;4025:34;;;;4075:18;;;4068:34;;;;4133:2;4118:18;;4111:34;;;;4176:3;4161:19;;4154:35;;;;4220:3;4205:19;;4198:35;4277:14;4270:22;4264:3;4249:19;;4242:51;4324:3;4309:19;;4302:35;4368:3;4353:19;;4346:35;3978:3;3963:19;10602:1164:6;3626:761:7;2676:31:6;;;;;;;;;;;;;;;;1649:178:1;;;;;;;;;;-1:-1:-1;1649:178:1;;;;;:::i;:::-;;:::i;9313:193:6:-;;;;;;;;;;-1:-1:-1;9313:193:6;;;;;:::i;:::-;;:::i;14655:688::-;1531:13:0;:11;:13::i;:::-;3023:21:4::1;:19;:21::i;:::-;-1:-1:-1::0;;;;;14818:23:6;::::2;14814:79;;14864:18;;-1:-1:-1::0;;;14864:18:6::2;;;;;;;;;;;14814:79;14907:6;14917:1;14907:11:::0;14903:61:::2;;14941:12;;-1:-1:-1::0;;;14941:12:6::2;;;;;;;;;;;14903:61;14987:21;14978:6;:30;14974:95;;;15031:27;;-1:-1:-1::0;;;15031:27:6::2;;;;;;;;;;;14974:95;15093:12;15119:9;-1:-1:-1::0;;;;;15119:14:6::2;15154:6;15119:55;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;15079:95;;;15190:7;15185:68;;15220:22;;-1:-1:-1::0;;;15220:22:6::2;;;;;;;;;;;15185:68;15297:9;-1:-1:-1::0;;;;;15268:68:6::2;;15320:6;15268:68;;;;160:25:7::0;;148:2;133:18;;14:177;15268:68:6::2;;;;;;;;14804:539;3065:20:4::1;2365:1:::0;-1:-1:-1;;;;;;;;;;;3972:62:4;3749:292;3065:20:::1;14655:688:6::0;;:::o;12852:1078::-;1531:13:0;:11;:13::i;:::-;13172:28:6;;;:73:::1;;-1:-1:-1::0;13216:29:6;;13172:73:::1;13155:161;;;13277:28;;-1:-1:-1::0;;;13277:28:6::1;;;;;;;;;;;13155:161;13326:10;:38:::0;;;13375:21:::1;:60:::0;;;13446:20:::1;:58:::0;;;13515:21:::1;:60:::0;;;13586:11:::1;:40:::0;;;13637:12:::1;:42:::0;;;13695:228:::1;::::0;;3373:25:7;;;3429:2;3414:18;;3407:34;;;3457:18;;;3450:34;;;3515:2;3500:18;;3493:34;;;3558:3;3543:19;;3536:35;;;3602:3;3587:19;;3580:35;;;13695:228:6::1;::::0;3360:3:7;3345:19;13695:228:6::1;;;;;;;12852:1078:::0;;;;;;:::o;4863:2671::-;4988:14;5016:15;1350:19:3;:17;:19::i;:::-;3023:21:4::1;:19;:21::i;:::-;5056:13:6::2;5072:12;:10;:12::i;:::-;5117:10;5099:29;::::0;;;:17:::2;:29;::::0;;;;;;;:36;;;;;;;;;5056:28;;-1:-1:-1;5099:36:6::2;;5095:97;;;5158:23;;-1:-1:-1::0;;;5158:23:6::2;;;;;;;;;;;5095:97;5232:10;5202:21;5226:17:::0;;;:5:::2;:17;::::0;;;;5287:18:::2;::::0;::::2;::::0;5226:17;;5287:23;5283:69:::2;;5340:1;5326:10;;:15;;;;;;;:::i;:::-;::::0;;;-1:-1:-1;;5283:69:6::2;5539:17;5571:4;:18;;;5593:1;5571:23:::0;5567:398:::2;;-1:-1:-1::0;5658:1:6::2;5567:398;;;5681:19:::0;;5708:5;;5681:23:::2;::::0;5703:1:::2;5681:23;:::i;:::-;:32:::0;5677:288:::2;;5815:18;::::0;;::::2;::::0;:22:::2;::::0;::::2;:::i;:::-;5803:34;;5677:288;;;-1:-1:-1::0;5953:1:6::2;5677:288;6003:21;6027:26;6043:9;6027:15;:26::i;:::-;6087:27:::0;;;6124:18:::2;::::0;;::::2;:30:::0;;;6164:18:::2;::::0;::::2;:23:::0;;6003:50;;-1:-1:-1;6124:18:6;;6087:19:::2;::::0;6164:23:::2;::::0;6124:18;;6164:23:::2;:::i;:::-;::::0;;;-1:-1:-1;;6214:18:6::2;::::0;::::2;::::0;6202:30;::::2;6198:91;;;6248:18;::::0;::::2;:30:::0;;;6198:91:::2;6320:13;6299:4;:17;;;:34;;;;;;;:::i;:::-;;;;;;;;6368:13;6343:4;:21;;;:38;;;;;;;:::i;:::-;::::0;;;-1:-1:-1;;6443:10:6::2;6425:29;::::0;;;:17:::2;:29;::::0;;;;;;;:36;;;;;;;;:43;;-1:-1:-1;;6425:43:6::2;6464:4;6425:43:::0;;::::2;::::0;;;6508:13:::2;:18:::0;;6464:4;;6508:13;;:18:::2;::::0;6464:4;;6508:18:::2;:::i;:::-;;;;;;;;6558:13;6536:18;;:35;;;;;;;:::i;:::-;::::0;;;-1:-1:-1;;6610:22:6::2;6635:17:::0;;;:10:::2;:17;::::0;;;;6663:18;;6635:17;;6680:1:::2;::::0;6635:17;;6610:22;6663:18:::2;::::0;6680:1;;6663:18:::2;:::i;:::-;;;;;;;;6713:13;6691:4;:18;;;:35;;;;;;;:::i;:::-;::::0;;;-1:-1:-1;;6773:112:6::2;::::0;;1736:25:7;;;1792:2;1777:18;;1770:34;;;6820:5:6;;6796:10:::2;::::0;6773:112:::2;::::0;1709:18:7;6773:112:6::2;;;;;;;6948:22;6973:34;6997:9;6973:23;:34::i;:::-;6948:59:::0;-1:-1:-1;7022:18:6;;7018:196:::2;;7061:142;::::0;;1736:25:7;;;1792:2;1777:18;;1770:34;;;7125:5:6;;7097:10:::2;::::0;7061:142:::2;::::0;1709:18:7;7061:142:6::2;;;;;;;7018:196;7322:9;:13:::0;7318:132:::2;;7356:83;::::0;7416:9:::2;160:25:7::0;;7388:10:6::2;::::0;7356:83:::2;::::0;148:2:7;133:18;7356:83:6::2;;;;;;;7318:132;-1:-1:-1::0;7481:9:6;;-1:-1:-1;7504:13:6;-1:-1:-1;;;;3065:20:4::1;2365:1:::0;-1:-1:-1;;;;;;;;;;;3972:62:4;3749:292;3065:20:::1;4863:2671:6::0;;:::o;14312:85::-;1531:13:0;:11;:13::i;:::-;14380:10:6::1;:8;:10::i;:::-;14312:85::o:0;9101:128::-;9168:7;9198:24;9216:6;9198:15;:24;:::i;:::-;9191:31;;9101:128;:::o;2293:101:0:-;1531:13;:11;:13::i;:::-;2357:30:::1;2384:1;2357:18;:30::i;9581:588:6:-:0;-1:-1:-1;;;;;9731:14:6;;9684:7;9731:14;;;:5;:14;;;;;9684:7;9772:12;:10;:12::i;:::-;-1:-1:-1;;;;;9812:56:6;;;;;;:17;:56;;;;;;;;:63;;;;;;;;;9756:28;;-1:-1:-1;9812:63:6;;9795:141;;;-1:-1:-1;9907:18:6;;;;9581:588;-1:-1:-1;;9581:588:6:o;9795:141::-;9950:4;:18;;;9972:1;9950:23;9946:62;;-1:-1:-1;9996:1:6;;9581:588;-1:-1:-1;;;9581:588:6:o;9946:62::-;10035:19;;10074:5;;10035:23;;10057:1;10035:23;:::i;:::-;:44;10018:126;;10111:18;;;;;:22;;;:::i;:::-;10104:29;9581:588;-1:-1:-1;;;;9581:588:6:o;10018:126::-;-1:-1:-1;10161:1:6;;9581:588;-1:-1:-1;;;9581:588:6:o;2244:229:1:-;1311:13;;735:10:2;;-1:-1:-1;;;;;1311:13:1;2339:24;;2335:96;;2386:34;;-1:-1:-1;;;2386:34:1;;-1:-1:-1;;;;;3042:32:7;;2386:34:1;;;3024:51:7;2997:18;;2386:34:1;;;;;;;;2335:96;2440:26;2459:6;2440:18;:26::i;:::-;2286:187;2244:229::o;14169:81:6:-;1531:13:0;:11;:13::i;:::-;14235:8:6::1;:6;:8::i;12057:537::-:0;1350:19:3;:17;:19::i;:::-;3023:21:4::1;:19;:21::i;:::-;12187:6:6::2;12197:1;12187:11:::0;12183:61:::2;;12221:12;;-1:-1:-1::0;;;12221:12:6::2;;;;;;;;;;;12183:61;12284:10;12254:21;12278:17:::0;;;:5:::2;:17;::::0;;;;12323:21:::2;::::0;::::2;::::0;:42;-1:-1:-1;12306:123:6::2;;;12397:21;;-1:-1:-1::0;;;12397:21:6::2;;;;;;;;;;;12306:123;12464:6;12439:4;:21;;;:31;;;;;;;:::i;:::-;::::0;;;-1:-1:-1;;12556:21:6::2;::::0;::::2;::::0;12486:101:::2;::::0;12512:10:::2;::::0;12486:101:::2;::::0;::::2;::::0;12536:6;1736:25:7;;1792:2;1777:18;;1770:34;1724:2;1709:18;;1562:248;12486:101:6::2;;;;;;;;12173:421;3065:20:4::1;2365:1:::0;-1:-1:-1;;;;;;;;;;;3972:62:4;3749:292;8405:450:6;8513:13;8582:1;8559:20;;:24;:74;;;;-1:-1:-1;8608:20:6;;8599:29;;:6;:29;:::i;:::-;:34;8559:74;8542:147;;;8667:11;;8658:20;;;;:::i;:::-;;;8542:147;8740:1;8716:21;;:25;:76;;;;-1:-1:-1;8766:21:6;;8757:30;;:6;:30;:::i;:::-;:35;8716:76;8699:150;;;8826:12;;8817:21;;;;:::i;:::-;;;8699:150;8405:450;;;:::o;7981:358::-;8081:7;8108:6;8118:1;8108:11;8104:50;;-1:-1:-1;8142:1:6;;7981:358;-1:-1:-1;7981:358:6:o;8104:50::-;8234:21;;8164:14;;8220:10;8229:1;8220:6;:10;:::i;:::-;8219:36;;;;:::i;:::-;8193:10;;:63;;;;:::i;:::-;8164:92;;8277:31;8301:6;8277:23;:31::i;:::-;8267:41;;;;:::i;:::-;;7981:358;-1:-1:-1;;;7981:358:6:o;10245:276::-;10350:7;10378:19;10389:7;10378:10;:19::i;:::-;10373:59;;-1:-1:-1;10420:1:6;;10245:276;-1:-1:-1;10245:276:6:o;10373:59::-;10449:65;10478:26;10496:7;10478:17;:26::i;10602:1164::-;-1:-1:-1;;;;;11066:14:6;;10716:22;11066:14;;;:5;:14;;;;;10716:22;;;;;;;;;;;;;;;;;11107:19;11072:7;11107:10;:19::i;:::-;11091:35;;11137:28;11180:8;:90;;11252:4;:18;;;11180:90;;;11207:26;11225:7;11207:17;:26::i;:::-;11137:133;;11281:28;11324:8;:122;;11445:1;11324:122;;;11351:75;11388:20;11351:15;:75::i;:::-;11281:165;;11478:4;:19;;;11511:4;:18;;;11543:4;:18;;;11575:4;:18;;;11607:4;:17;;;11638:4;:21;;;11673:8;11695:20;11729;11457:302;;;;;;;;;;;;;;;;;;;;;;10602:1164;;;;;;;;;;;:::o;1649:178:1:-;1531:13:0;:11;:13::i;:::-;1738::1::1;:24:::0;;-1:-1:-1;;;;;1738:24:1;::::1;-1:-1:-1::0;;;;;;1738:24:1;;::::1;::::0;::::1;::::0;;;1802:7:::1;1684::0::0;1710:6;-1:-1:-1;;;;;1710:6:0;;1638:85;1802:7:1::1;-1:-1:-1::0;;;;;1777:43:1::1;;;;;;;;;;;1649:178:::0;:::o;9313:193:6:-;-1:-1:-1;;;;;9437:48:6;;9409:4;9437:48;;;:17;:48;;;;;9409:4;9486:12;:10;:12::i;:::-;9437:62;;;;;;;;;;;-1:-1:-1;9437:62:6;;;;9436:63;;9313:193;-1:-1:-1;;9313:193:6:o;1796:162:0:-;1684:7;1710:6;-1:-1:-1;;;;;1710:6:0;735:10:2;1855:23:0;1851:101;;1901:40;;-1:-1:-1;;;1901:40:0;;735:10:2;1901:40:0;;;3024:51:7;2997:18;;1901:40:0;2878:203:7;3749:292:4;3872:25;:23;:25::i;:::-;2407:1;-1:-1:-1;;;;;;;;;;;3972:62:4;3749:292::o;1878:128:3:-;1796:7;;-1:-1:-1;;;1796:7:3;;;;1939:61;;;1974:15;;-1:-1:-1;;;1974:15:3;;;;;;;;;;;2586:117;1597:16;:14;:16::i;:::-;2644:7:::1;:15:::0;;-1:-1:-1;;;;2644:15:3::1;::::0;;2674:22:::1;735:10:2::0;2683:12:3::1;2674:22;::::0;-1:-1:-1;;;;;3042:32:7;;;3024:51;;3012:2;2997:18;2674:22:3::1;;;;;;;2586:117::o:0;2011:153:1:-;2100:13;2093:20;;-1:-1:-1;;;;;;2093:20:1;;;2123:34;2148:8;2123:24;:34::i;2339:115:3:-;1350:19;:17;:19::i;:::-;2408:4:::1;2398:14:::0;;-1:-1:-1;;;;2398:14:3::1;-1:-1:-1::0;;;2398:14:3::1;::::0;;2427:20:::1;2434:12;735:10:2::0;;656:96;3586:157:4;-1:-1:-1;;;;;;;;;;;4560:52:4;2407:1;4560:63;3644:93;;3696:30;;-1:-1:-1;;;3696:30:4;;;;;;;;;;;2078:126:3;1796:7;;-1:-1:-1;;;1796:7:3;;;;2136:62;;2172:15;;-1:-1:-1;;;2172:15:3;;;;;;;;;;;2912:187:0;2985:16;3004:6;;-1:-1:-1;;;;;3020:17:0;;;-1:-1:-1;;;;;;3020:17:0;;;;;;3052:40;;3004:6;;;;;;;3052:40;;2985:16;3052:40;2975:124;2912:187;:::o;196:139:7:-;-1:-1:-1;;;;;279:31:7;;269:42;;259:70;;325:1;322;315:12;340:383;416:6;424;477:2;465:9;456:7;452:23;448:32;445:52;;;493:1;490;483:12;445:52;532:9;519:23;551:39;584:5;551:39;:::i;:::-;609:5;687:2;672:18;;;;659:32;;-1:-1:-1;;;340:383:7:o;728:829::-;832:6;840;848;856;864;872;925:3;913:9;904:7;900:23;896:33;893:53;;;942:1;939;932:12;893:53;-1:-1:-1;;987:23:7;;;1107:2;1092:18;;1079:32;;-1:-1:-1;1210:2:7;1195:18;;1182:32;;1313:2;1298:18;;1285:32;;-1:-1:-1;1416:3:7;1401:19;;1388:33;;-1:-1:-1;1520:3:7;1505:19;1492:33;;-1:-1:-1;728:829:7;-1:-1:-1;728:829:7:o;1815:226::-;1874:6;1927:2;1915:9;1906:7;1902:23;1898:32;1895:52;;;1943:1;1940;1933:12;1895:52;-1:-1:-1;1988:23:7;;1815:226;-1:-1:-1;1815:226:7:o;2238:255::-;2297:6;2350:2;2338:9;2329:7;2325:23;2321:32;2318:52;;;2366:1;2363;2356:12;2318:52;2405:9;2392:23;2424:39;2457:5;2424:39;:::i;4602:127::-;4663:10;4658:3;4654:20;4651:1;4644:31;4694:4;4691:1;4684:15;4718:4;4715:1;4708:15;4734:125;4799:9;;;4820:10;;;4817:36;;;4833:18;;:::i;:::-;4734:125;;;;:::o;4864:127::-;4925:10;4920:3;4916:20;4913:1;4906:31;4956:4;4953:1;4946:15;4980:4;4977:1;4970:15;4996:120;5036:1;5062;5052:35;;5067:18;;:::i;:::-;-1:-1:-1;5101:9:7;;4996:120::o;5121:128::-;5188:9;;;5209:11;;;5206:37;;;5223:18;;:::i;5254:112::-;5286:1;5312;5302:35;;5317:18;;:::i;:::-;-1:-1:-1;5351:9:7;;5254:112::o;5371:168::-;5444:9;;;5475;;5492:15;;;5486:22;;5472:37;5462:71;;5513:18;;:::i",
+    "optimization_runs": 200,
+    "optimization_enabled": 1
+  },
+  "evm_version": "cancun",
+  "tx_hash": "0x8df5f7382fb3a6d6c06afaabee90919522fe596cc8c6b2a9c5f72991fb64c6f9"
+}

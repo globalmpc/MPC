@@ -1,0 +1,15 @@
+@import '../../styles/theme.css';
+@layer base {
+  body { background: var(--background); color: var(--foreground); font-family: var(--font-sans); }
+  .font-display { letter-spacing: -0.02em; }
+  a, button { -webkit-tap-highlight-color: transparent; }
+  :focus-visible { outline: 2px solid var(--ring); outline-offset: 4px; }
+}
+.mpc-terrain {
+  height: 62vh; min-height: 340px; max-height: 720px;
+  background: url('/brand/terrain-dark-1280.avif') top center / cover no-repeat;
+  mask-image: linear-gradient(to bottom, black 0%, black 20%, transparent 88%);
+}
+@media (min-width: 1281px) { .mpc-terrain { background-image: url('/brand/terrain-dark-1920.avif'); } }
+@keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: no-preference) { .mpc-reveal { animation: rise 350ms var(--ease-out-expo); } }

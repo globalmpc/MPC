@@ -1,0 +1,11 @@
+{
+  "chainId": 204,
+  "network": "opBNB Mainnet",
+  "address": "0x843e4ff9242c3e81b676434b2876fb090d4a5783",
+  "creationBlock": 182636005,
+  "transactionHash": "0x8df5f7382fb3a6d6c06afaabee90919522fe596cc8c6b2a9c5f72991fb64c6f9",
+  "compiler": "v0.8.36+commit.8a079791",
+  "source": "https://opbnbscan.com/address/0x843e4ff9242c3e81b676434b2876fb090d4a5783?view=contract_code",
+  "retrievedAt": "2026-09-16",
+  "provenance": "Verified source and compiler input from the contract explorer."
+}
