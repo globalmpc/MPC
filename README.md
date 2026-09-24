@@ -28,6 +28,11 @@ The current check-in application uses:
 | --- | --- | --- |
 | opBNB Mainnet | MPCCheckinCore | [`0x843e4ff9242c3e81b676434b2876fb090d4a5783`](https://opbnbscan.com/address/0x843e4ff9242c3e81b676434b2876fb090d4a5783?view=contract_code) |
 
+## Documentation
+
+- [Technical documentation](docs/TECHNICAL.md): system components, deployment, access control, operations and verification.
+- [Contract specification](docs/SPECIFICATION.md): `MPCCheckinCore` state, reward formula, functions, events, invariants and trust assumptions.
+
 ## Current Features
 
 - One check-in per wallet per UTC day.
