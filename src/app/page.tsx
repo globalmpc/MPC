@@ -10,8 +10,11 @@ export default function Home() {
   ]
   return <div className="relative isolate flex min-h-dvh flex-col overflow-x-clip">
     <div className="mpc-terrain pointer-events-none absolute inset-x-0 top-0 -z-10" aria-hidden="true" />
-    <header className="flex items-center justify-between gap-4 px-5 py-5 sm:px-8">
-      <Link href="/" aria-label="MPC Pre CheckIn home"><Image src="/brand/mpc-lockup.svg" alt="MPC" width={120} height={51} unoptimized /></Link>
+    <header className="mx-auto flex h-16 w-full max-w-7xl items-center justify-between gap-4 px-6 lg:px-10">
+      <Link href="/" aria-label="MPC Pre CheckIn home" className="flex items-center gap-2.5">
+        <Image src="/brand/mpc-mark.svg" alt="" width={28} height={28} unoptimized className="h-7 w-7" />
+        <span className="font-display text-base font-semibold tracking-tight antialiased">MPC</span>
+      </Link>
       <span className="font-mono text-[10px] tracking-widest text-muted-foreground uppercase">opBNB · Community</span>
     </header>
     <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col justify-center gap-7 px-5 py-5 sm:px-8">
