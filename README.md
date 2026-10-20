@@ -10,23 +10,32 @@ The check-in application provides an on-chain record of community participation 
 
 Website: https://pre-check-in.globalmpc.tech
 
-## Technology stack
+## Technology Stack
 
 The current check-in application uses:
 
-- Blockchain: opBNB Mainnet (BNB Chain ecosystem).
-- Smart contracts: Solidity 0.8.36, OpenZeppelin 5.7.0.
-- Frontend: Next.js, React, TypeScript, Tailwind CSS, wagmi and viem.
+- **Blockchain:** opBNB Mainnet (BNB Chain ecosystem).
+- **Smart contracts:** Solidity 0.8.36, OpenZeppelin 5.7.0.
+- **Frontend:** Next.js, React, TypeScript, Tailwind CSS, wagmi and viem.
 
-## Supported network
+## Supported Networks
 
-- opBNB Mainnet (Chain ID: 204) — current check-in deployment.
+- **opBNB Mainnet (Chain ID: 204)** — current check-in deployment.
 
-## Contract address
+## Contract Addresses
 
 | Network | Contract | Address |
 | --- | --- | --- |
 | opBNB Mainnet | MPCCheckinCore | [`0x843e4ff9242c3e81b676434b2876fb090d4a5783`](https://opbnbscan.com/address/0x843e4ff9242c3e81b676434b2876fb090d4a5783?view=contract_code) |
+
+## BNB Chain Configuration
+
+The opBNB deployment is set in these files:
+
+- [`src/components/Providers.tsx`](src/components/Providers.tsx) — wagmi configuration with `opBNB` (Chain ID 204) as the only chain and `https://opbnb-mainnet-rpc.bnbchain.org` as its RPC.
+- [`src/components/Checkin.tsx`](src/components/Checkin.tsx) — reads and writes `MPCCheckinCore` on Chain ID 204 and asks the wallet to switch to opBNB.
+- [`src/lib/deployment.ts`](src/lib/deployment.ts) — the contract address used by the application.
+- [`contracts/verification/deployment.json`](contracts/verification/deployment.json) — chain ID, address, creation block, deployment transaction and compiler version, retrieved from opBNBScan.
 
 ## Documentation
 
