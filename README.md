@@ -65,3 +65,7 @@ The broader RWA infrastructure is in the design and build stage. The following d
 | Ecosystem expansion | Additional resource projects and jurisdiction profiles. |
 
 These are development directions, not live capabilities of the check-in contract. Scope and timing depend on technical validation, regulatory requirements and partner readiness.
+
+---
+
+Maintained by [Global MPC (Mineral Project Coin)](https://globalmpc.tech). $MPC remains at the Pre-TGE stage, and no token contract address has been published. Official site: https://globalmpc.tech
