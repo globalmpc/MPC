@@ -1,5 +1,7 @@
 # MPC
 
+Official website: [MPC (Mineral Project Coin)](https://www.globalmpc.tech) — mining real-world asset (RWA) infrastructure.
+
 MPC translates the world's mining resources into the language of global capital markets.
 
 MPC is developing blockchain infrastructure for standardized mining real-world asset (RWA) issuance. Its aim is to structure the mining value chain into tokenizable assets with risk and return information that institutional investors can evaluate.
@@ -52,7 +54,7 @@ The opBNB deployment is set in these files:
 
 ## Roadmap
 
-The broader RWA infrastructure is in the design and build stage. The following development directions reflect the [MPC website](https://www.globalmpc.tech/). The application in this repository currently supports opBNB Mainnet.
+The broader RWA infrastructure is in the design and build stage. The following development directions reflect the [MPC website](https://www.globalmpc.tech). The application in this repository currently supports opBNB Mainnet.
 
 ### Future Features
 
