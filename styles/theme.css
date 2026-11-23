@@ -40,7 +40,7 @@
   --color-ring: var(--ring);
 
 
-  --color-mpc-copper: #c2773f;
+  --color-mpc-copper: var(--mark);
 
 
   --radius-sm: 2px;
