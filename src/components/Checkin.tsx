@@ -65,15 +65,18 @@ function CommunityStats({ refresh }: { refresh: number }) {
     void refetchToday(); void refetchWallets(); void refetchParticipations()
     if (day !== undefined) void refetchDaily()
   }, [refresh, day, refetchToday, refetchWallets, refetchParticipations, refetchDaily])
-  return <div className="my-5">
-    <dl className="grid grid-cols-3 divide-x divide-border">
+  return <div className="my-5 @container">
+    {/* Sized by the card, not the screen: one count per row (label left, number right) until the
+        stats are 28rem wide, then three columns. Phones and the narrow two-card layout at md both
+        get rows; the full-width card and the desktop card keep the columns. */}
+    <dl className="divide-y divide-border @md:grid @md:grid-cols-3 @md:divide-x @md:divide-y-0">
       {([
         ['Wallets today', daily.data?.[0]],
         ['Total wallets', wallets.data],
         ['Total participations', participations.data],
-      ] as const).map(([label, value]) => <div key={label} className="px-2 first:pl-0 last:pr-0">
-        <dt className="text-[10px] leading-relaxed text-muted-foreground sm:text-xs">{label}</dt>
-        <dd className="mt-1 font-mono text-lg text-foreground tabular-nums sm:text-xl">{number(value)}</dd>
+      ] as const).map(([label, value]) => <div key={label} className="flex items-baseline justify-between gap-4 py-2 first:pt-0 last:pb-0 @md:block @md:px-2 @md:py-0 @md:first:pl-0 @md:last:pr-0">
+        <dt className="text-xs leading-relaxed text-muted-foreground">{label}</dt>
+        <dd className="font-mono text-lg text-foreground tabular-nums @md:mt-1 @md:text-xl">{number(value)}</dd>
       </div>)}
     </dl>
     {unavailable && <div className="mt-2"><RetryLine label="Community stats unavailable. Retry" onRetry={() => { void today.refetch(); void wallets.refetch(); void participations.refetch(); if (day !== undefined) void daily.refetch() }} /></div>}
