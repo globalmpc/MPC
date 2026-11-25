@@ -26,6 +26,8 @@
   --positive: oklch(0.62 0.1 155);
   --alert: oklch(0.62 0.12 45);
   --destructive: oklch(0.55 0.18 25);
+  /* Failure text on dark surfaces. Fill --destructive fails contrast as type (정본 0.3.0). */
+  --destructive-text: oklch(0.64 0.15 25);
   --destructive-foreground: oklch(0.96 0.005 250);
   --border: oklch(1 0 0 / 8%);
   --border-strong: oklch(1 0 0 / 16%);

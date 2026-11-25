@@ -16,7 +16,7 @@ const number = (value: bigint | undefined) => value === undefined ? '—' : valu
 const checkInData = encodeFunctionData({ abi: ABI, functionName: 'checkIn' })
 
 function RetryLine({ label, onRetry }: { label: string; onRetry: () => void }) {
-  return <button type="button" onClick={onRetry} className="cursor-pointer text-xs text-destructive underline">{label}</button>
+  return <button type="button" onClick={onRetry} className="cursor-pointer text-xs text-destructive-text underline">{label}</button>
 }
 
 
@@ -115,7 +115,7 @@ function ConnectCommunityWallet() {
       {choices.map((c) => <Button key={c.uid} variant="ghost" size="sm" disabled={busy} onClick={() => void connect(c)}>{c.type === 'walletConnect' ? 'WalletConnect' : c.name}</Button>)}
       {choices.length === 0 && <p className="text-xs text-muted-foreground">Wallet options are loading. If none appear, open this page in your wallet browser.</p>}
     </div>}
-    {error && <p role="status" className="text-xs text-destructive">{error}</p>}
+    {error && <p role="status" className="text-xs text-destructive-text">{error}</p>}
   </div>
 }
 
@@ -233,9 +233,9 @@ function ConnectedCheckin({ address, allowDisconnect, onConfirmed, onBusyChange 
           Checking…
         </> : busy ? 'Recording participation…' : pending ? 'Check transaction status' : statusUnavailable ? 'Retry status check' : paused.data ? 'Participation paused' : eligibility.data === false ? 'You’re counted today' : 'Count me in today'}
       </Button>
-      {!pending && statusUnavailable && <p role="status" className="text-xs text-destructive">Could not load your check-in status. Please retry.</p>}
+      {!pending && statusUnavailable && <p role="status" className="text-xs text-destructive-text">Could not load your check-in status. Please retry.</p>}
       {!pending && paused.data && <p role="status" className="text-xs text-muted-foreground">Community participation is temporarily paused. Please try again later.</p>}
-      {message && <p role="status" className={`text-xs ${failed ? 'text-destructive' : 'text-muted-foreground'}`}>{message}</p>}
+      {message && <p role="status" className={`text-xs ${failed ? 'text-destructive-text' : 'text-muted-foreground'}`}>{message}</p>}
       {hash && <a className="text-xs text-copper underline" href={`https://opbnbscan.com/tx/${hash}`} target="_blank" rel="noopener noreferrer">View transaction</a>}
     </div>
   )

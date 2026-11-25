@@ -17,8 +17,8 @@ export default function Home() {
       </Link>
       <span className="font-mono text-[10px] tracking-widest text-muted-foreground uppercase">opBNB · Community</span>
     </header>
-    <main className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-6 py-5 lg:px-10">
-      <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col justify-center gap-7">
+    <main className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-6 py-24 lg:px-10 lg:py-32">
+      <div className="mx-auto flex w-full flex-1 flex-col justify-center gap-7">
         <div className="text-center mpc-reveal">
           <h1 className="font-display text-4xl sm:text-5xl font-medium bg-linear-to-r from-copper via-copper-glow to-gold bg-clip-text text-transparent">Pre CheckIn</h1>
           <p className="mt-3 text-sm text-muted-foreground">Mining RWA, built together. One day at a time.</p>
