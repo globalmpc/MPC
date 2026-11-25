@@ -7,6 +7,18 @@
 @import './pretendard.css';
 @import './tokens.css' layer(mpc-design);
 
+/* Radius (FRONT-48): the values live only in the design-system copy, styles/tokens.css, exactly as
+   published. Tailwind uses --radius-* as its own theme keys, so a normal @theme entry pointing at
+   var(--radius-sm) would be emitted as `--radius-sm: var(--radius-sm)`, a self reference. With
+   `reference` nothing is emitted: the rounded-* utilities read var(--radius-*), and the only
+   declaration of those variables is the token copy's. src/lib/lion-qa-tokens.test.ts guards it. */
+@theme inline reference {
+  --radius-sm: var(--radius-sm);
+  --radius-md: var(--radius-md);
+  --radius-lg: var(--radius-lg);
+  --radius-xl: var(--radius-xl);
+}
+
 @theme inline {
 
   --color-background: var(--background);
@@ -33,6 +45,7 @@
   --color-positive: var(--positive);
   --color-alert: var(--alert);
   --color-destructive: var(--destructive);
+  --color-destructive-text: var(--destructive-text);
   --color-destructive-foreground: var(--destructive-foreground);
   --color-border: var(--border);
   --color-border-strong: var(--border-strong);
@@ -42,11 +55,6 @@
 
   --color-mpc-copper: var(--mark);
 
-
-  --radius-sm: 2px;
-  --radius-md: 4px;
-  --radius-lg: 6px;
-  --radius-xl: 10px;
 
   --radius-full: 9999px;
 
