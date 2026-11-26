@@ -91,11 +91,19 @@ Next.js 16, React 19, TypeScript, Tailwind CSS 4, wagmi 3 and viem 2. The app is
 
 ### Wallets
 
-Injected browser wallets are supported. WalletConnect is enabled when `NEXT_PUBLIC_REOWN_PROJECT_ID` is set at build time; the Reown project is configured with the production domain in its origin allowlist.
+Injected browser wallets are supported. WalletConnect loads in the browser when `NEXT_PUBLIC_REOWN_PROJECT_ID` is set at build time. The Reown project must allow the site's origin. Its QR provider uses a scoped pnpm override for patched Zod and omits AppKit's optional Base Account SDK. Recheck these overrides when updating the provider.
 
 ### Analytics
 
 Optional GA4, enabled by `NEXT_PUBLIC_GA_MEASUREMENT_ID`. Only four allowlisted events are sent (`wallet_connect`, `checkin_submit`, `checkin_confirm`, `project_click`). Wallet addresses and transaction hashes are never sent. Analytics failures cannot interrupt a wallet action.
+
+### Browser security headers
+
+Next.js applies the security headers to every route. The page cannot be framed, MIME sniffing is disabled, and cross-origin referrers are limited to the origin. Vercel supplies HSTS on HTTPS responses.
+
+The script policy allows local bundles, Next.js inline hydration and, when GA4 is configured, the Google tag loader. Inline event handlers are blocked. Production builds disable script evaluation from strings.
+
+The connection policy allows the site and the opBNB RPC. Configuring GA4 or WalletConnect adds the corresponding collection or relay endpoints. When those integrations change, test the proposed connection policy in report-only mode on an allowlisted origin before enforcing it. Verify injected and QR pairing, RPC reads and GA4 collection, then check the headers on the deployed homepage, a static asset and a missing route.
 
 ## 6. Testing and quality checks
 
